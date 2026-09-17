@@ -195,6 +195,13 @@ func (builder Builder) Train(ctx context.Context, name string, prepared Prepared
 		}
 	}
 	_, codec, err := inspection.Model.Architecture.ResolveTokenizer()
+	if tokenizer := inspection.Model.Architecture.Tokenizer; tokenizer.HuggingFace != nil {
+		var close func()
+		codec, close, err = training.OpenHuggingFaceTokenizer(ctx, tokenizer.HuggingFace.Spec(tokenizer.Revision, inspection.Model.Architecture.VocabularySize), inspection.Model.Architecture.Transformers)
+		if err == nil {
+			defer close()
+		}
+	}
 	if err != nil {
 		// Legacy imported and test architectures may carry an opaque revision.
 		// Real backends still validate the exact contract before execution.
@@ -771,7 +778,17 @@ func (builder Builder) executeTrainingAttempt(ctx context.Context, name, modelPa
 		runBOM.Parameters = *effectiveParameters
 	}
 	tokenizerSpec := training.TokenizerSpec{Name: record.Architecture.Tokenizer.Name, Revision: record.Architecture.Tokenizer.Revision, VocabularySize: int(record.Architecture.VocabularySize), PadID: 0, BOSID: 1, EOSID: 2}
-	if selection.Execution.Backend.Name == training.BackendPyTorch || selection.Execution.Backend.Name == training.BackendTorchTitan || selection.Execution.Backend.Name == training.BackendMLX {
+	var tokenizerCodec training.TokenCodec
+	if tokenizer := record.Architecture.Tokenizer; tokenizer.HuggingFace != nil {
+		tokenizerSpec = tokenizer.HuggingFace.Spec(tokenizer.Revision, record.Architecture.VocabularySize)
+		var close func()
+		var err error
+		tokenizerCodec, close, err = training.OpenHuggingFaceTokenizer(ctx, tokenizerSpec, record.Architecture.Transformers)
+		if err != nil {
+			return Inspection{}, err
+		}
+		defer close()
+	} else if selection.Execution.Backend.Name == training.BackendPyTorch || selection.Execution.Backend.Name == training.BackendTorchTitan || selection.Execution.Backend.Name == training.BackendMLX || selection.Execution.Backend.Name == training.BackendTransformers {
 		var err error
 		tokenizerSpec, _, err = record.Architecture.ResolveTokenizer()
 		if err != nil {
@@ -835,7 +852,7 @@ func (builder Builder) executeTrainingAttempt(ctx context.Context, name, modelPa
 		RunID: pin.ID, Stage: stage.Name, Objective: stage.Objective,
 		Conversation:       runBOM.Conversation,
 		ArchitectureSHA256: record.ArchitectureSHA256,
-		Architecture:       architectureJSON, Tokenizer: tokenizerSpec, BOM: prepared.BOM, Inputs: prepared.Inputs,
+		Architecture:       architectureJSON, Tokenizer: tokenizerSpec, TokenizerCodec: tokenizerCodec, BOM: prepared.BOM, Inputs: prepared.Inputs,
 		Parameters: runBOM.Parameters, Records: records, EvaluationRecords: evaluationRecords, EvaluationSet: EvaluationSetValue(runBOM.EvaluationSet), Initialization: initializationForAttempt(runBOM.Initialization, resume), Resume: resume,
 		Parallelism:       runBOM.Execution.Parallelism,
 		ArtifactDirectory: filepath.Join(runDirectory, artifactPrefix), ArtifactPrefix: artifactPrefix, Report: report,
