@@ -985,6 +985,12 @@ func resolveRunInitialization(inspection Inspection, requestedRunID string) (*tr
 			if pin.ID == "" {
 				return nil, fmt.Errorf("initialize from run %s: model run pin is missing", run.ID)
 			}
+			if inspection.Model.Architecture.Transformers != nil {
+				directory := filepath.Join(inspection.Path, "runs", runDirectoryName(pin))
+				if err := verifyTransformersContinuationArtifacts(directory, inspection.Model.Architecture, run.Observation.Artifacts); err != nil {
+					return nil, fmt.Errorf("initialize from run %s: %w", run.ID, err)
+				}
+			}
 			path := filepath.Join(inspection.Path, "runs", runDirectoryName(pin), filepath.FromSlash(artifact.Path))
 			if err := VerifyArtifactFile(path, artifact); err != nil {
 				return nil, fmt.Errorf("initialize from run %s: %w", run.ID, err)

@@ -132,6 +132,33 @@ The new-family matrix honors the selected mixed precision; existing Llama and
 Qwen smoke tests also run as baseline FP32 regressions.
 CPU and mocked hardware-policy tests do not establish GPU correctness.
 
+For the byte-versus-HF tokenizer lifecycle audit, additionally set
+`WALDO_HF_TOKENIZER_DIR` to the pinned Qwen3 tokenizer files used by
+`docs/examples/transformers-qwen3-tokenizer-smoke.yaml`, then run:
+
+```bash
+WALDO_TRANSFORMERS_DEVICE=cuda CUDA_VISIBLE_DEVICES=0 \
+go test ./internal/model -run '^TestTransformersTokenizerLifecycle$' -v -count=1
+```
+
+This FP32 test trains and continues tiny random Qwen3 models for both tokenizer
+types, checks accounting/package evidence, streams deterministic chat, exercises
+stop strings and context sliding, and exports without access to the original
+tokenizer directory. An independent offline Transformers process reloads the
+source and export, checks tokenizer pins and encoding parity, compares exact
+weights/logits, and reproduces WALDO's greedy output. The byte tokenizer is a
+WALDO descriptor, not an `AutoTokenizer` asset; its documented byte mapping is
+used explicitly. Corrupt retained tokenizer artifacts must fail chat,
+continuation, and export. This complements the worker unit tests for EOS framing,
+special-ID validation, package integrity, and stop-prefix buffering; random
+generation does not guarantee that the EOS generation branch is exercised.
+
+The DGX Spark audit on 2026-10-01 exposed and verified a fix for continuation
+accepting a corrupt retained tokenizer artifact. Continuation now verifies every
+retained source-run artifact, requires config/tokenizer evidence, and checks HF
+tokenizer hashes against architecture pins. Both tokenizer lifecycle tests passed
+on CUDA after the fix, including independent export parity and tamper rejection.
+
 ### External services
 
 Live tests are never run by `testing/all.sh`. Their environment variables are
