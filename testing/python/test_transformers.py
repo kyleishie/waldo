@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -94,6 +95,34 @@ class TokenizerConfigurationTests(unittest.TestCase):
         spec["config"] = dict(model_type="qwen3")
         with self.assertRaisesRegex(ValueError, "model_type"):
             worker.configuration(package, spec)
+
+
+class FinalModelValidationTests(unittest.TestCase):
+    def test_nonfinite_parameters_and_buffers_fail(self):
+        class Tensor:
+            def __init__(self, values, floating=True):
+                self.values, self.floating = values, floating
+            def is_floating_point(self): return self.floating
+            def is_complex(self): return False
+            def detach(self): return self
+            def reshape(self, *_): return self
+            def split(self, size):
+                self_size = size
+                return [self.values[i:i+self_size] for i in range(0, len(self.values), self_size)]
+        def isfinite(values):
+            return types.SimpleNamespace(all=lambda: types.SimpleNamespace(item=lambda: all(math.isfinite(x) for x in values)))
+        with patch.dict(sys.modules, torch=types.SimpleNamespace(isfinite=isfinite)):
+            for group in ("parameter", "buffer"):
+                for value in (0.5, float("nan"), float("inf"), -float("inf")):
+                    with self.subTest(group=group, value=value):
+                        values = [("bad", Tensor([1.0, value]))]
+                        model = types.SimpleNamespace(named_parameters=lambda: values if group == "parameter" else [],
+                                                      named_buffers=lambda: values if group == "buffer" else [])
+                        if math.isfinite(value):
+                            worker.validate_model_finite(model)
+                        else:
+                            with self.assertRaisesRegex(ValueError, "non-finite model tensor: bad"):
+                                worker.validate_model_finite(model)
 
 
 class TransformersStreamTests(unittest.TestCase):
