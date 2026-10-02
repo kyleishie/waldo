@@ -18,7 +18,7 @@ import tempfile
 import traceback
 import zipfile
 
-REVISION = "builtin-transformers-worker-schema-1-r4"
+REVISION = "builtin-transformers-worker-schema-1-r5"
 PROTOCOL_OUTPUT = sys.stdout
 
 
@@ -211,6 +211,18 @@ def parameter_evidence(model, config):
     return result
 
 
+def validate_model_finite(model):
+    """Check the final optimizer update too, before publishing any artifacts."""
+    import torch
+    for values in (model.named_parameters(), model.named_buffers()):
+        for name, value in values:
+            if value.is_floating_point() or value.is_complex():
+                # Bound temporary isfinite masks even for large embedding tables.
+                for chunk in value.detach().reshape(-1).split(1024 * 1024):
+                    if not torch.isfinite(chunk).all().item():
+                        raise ValueError(f"non-finite model tensor: {name}")
+
+
 def write_json(path, value):
     temporary = str(path) + ".tmp"
     with open(temporary, "w", encoding="utf-8") as stream:
@@ -369,6 +381,10 @@ def run():
                 # below remain pure held-out cross entropy, not router loss.
                 weight = targets / (num_items_in_batch if num_items_in_batch is not None else targets)
                 loss = loss + config.router_aux_loss_coef * auxiliary * weight
+            # Trainer's logging filter can hide NaN/Inf in training_loss.
+            # Reject the actual objective before backward, not its logged mean.
+            if not torch.isfinite(loss).all().item():
+                raise ValueError("non-finite model loss")
             if model.training:
                 for item in counts:
                     for corpus, count in item.items():
@@ -408,6 +424,7 @@ def run():
         if not math.isfinite(loss):
             raise ValueError("Transformers reported a non-finite held-out loss")
         evaluations.append(dict(step=trainer.state.global_step, tokens=sum(consumption.values()), metrics={"heldout_loss": loss}))
+    validate_model_finite(model)
     directory.mkdir(parents=True, exist_ok=True)
     temporary = directory / "model.safetensors.tmp"
     save_model(model, str(temporary), metadata={"format": "pt", "waldo_backend": "huggingface-transformers", "waldo_architecture_sha256": begin["architecture_sha256"]})

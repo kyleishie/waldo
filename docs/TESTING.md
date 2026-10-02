@@ -166,6 +166,14 @@ output, abrupt exits, diagnostics, and process reaping. Run the opt-in
 `TestTransformersRejectsByteSpecialIDs` model test with the pinned runtime to
 verify that incompatible byte configurations fail before producing weights.
 
+`TestTransformersRejectsDivergentTraining` uses the pinned runtime with a
+deliberately divergent FP32 CPU learning rate and no held-out evaluation. It
+requires a non-finite-loss error and no published weights. The worker additionally
+checks final floating-point parameters and buffers before saving, since the last
+optimizer update may corrupt them after the last loss calculation. Unicode tests
+check bounded, lossless output frames through both the Python emitter and Go
+reader, plus stop-prefix and incomplete UTF-8 handling.
+
 ### External services
 
 Live tests are never run by `testing/all.sh`. Their environment variables are

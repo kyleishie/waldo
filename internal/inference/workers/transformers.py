@@ -11,6 +11,10 @@ import time
 
 emit = support["emit"]
 
+# At most 64 KiB UTF-8 / ~86 KiB base64 per frame, well below Go's 1 MiB
+# scanner limit. Slice text by code points so each emitted frame is valid UTF-8.
+OUTPUT_CHUNK_CHARACTERS = 16 * 1024
+
 
 class Output:
     """Hold potential stop prefixes across streamed text boundaries."""
@@ -35,8 +39,9 @@ class Output:
                         if self.pending.endswith(stop[:size]):
                             hold = max(hold, size)
             end = len(self.pending) - hold
-        if end:
-            emit("token", data=base64.b64encode(self.pending[:end].encode("utf-8")).decode("ascii"))
+        for start in range(0, end, OUTPUT_CHUNK_CHARACTERS):
+            text = self.pending[start:min(end, start + OUTPUT_CHUNK_CHARACTERS)]
+            emit("token", data=base64.b64encode(text.encode("utf-8")).decode("ascii"))
         self.pending = self.pending[end:]
 
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -178,5 +179,44 @@ func TestTransformersDiagnosticsBound(t *testing.T) {
 	}
 	if len(diagnostics.String()) != 65536 {
 		t.Fatal("unbounded diagnostics")
+	}
+}
+
+func TestTransformersLargeValidUnicodeFrames(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("Python required for actual Output framing test")
+	}
+	// Use the real Python Output class through the real Go protocol reader,
+	// without requiring model dependencies or downloading a tokenizer.
+	program := `
+import ast, json, pathlib, sys
+def emit(kind, **data):
+    print(json.dumps(dict(schema=1, kind=kind, **data)), flush=True)
+path = pathlib.Path("workers/transformers.py")
+module = ast.parse(path.read_text())
+module.body = [node for node in module.body if not isinstance(node, ast.Try)]
+scope = {"support": {"emit": emit}}
+exec(compile(module, str(path), "exec"), scope)
+emit("ready", context_tokens=128)
+for line in sys.stdin:
+    scope["Output"]([]).write("é世界😀" * 100000, final=True)
+    emit("complete", tokens=1, finish_reason="max_tokens")
+`
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	session, err := startTransformersSession(ctx, python, []string{"-c", program}, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assertTransformersReaped(t, session)
+	var streamed strings.Builder
+	result, err := session.Generate(ctx, "test", Options{MaxTokens: 1, TopP: 1}, func(token Token) error { streamed.Write(token.Bytes); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := strings.Repeat("é世界😀", 100000)
+	if result.Text != expected || streamed.String() != expected {
+		t.Fatal("chunking changed Unicode output")
 	}
 }

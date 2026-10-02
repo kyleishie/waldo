@@ -5,6 +5,7 @@ package model_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -46,6 +47,50 @@ func TestTransformersRejectsByteSpecialIDs(t *testing.T) {
 				}
 				if entry.Name() == "model.safetensors" {
 					t.Errorf("invalid config produced weights: %s", path)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTransformersRejectsDivergentTraining(t *testing.T) {
+	if os.Getenv("WALDO_TRANSFORMERS_PYTHON") == "" || os.Getenv("WALDO_TRANSFORMERS_WHEEL") == "" {
+		t.Skip("set Transformers Python and wheel")
+	}
+	// The deliberately divergent FP32 CPU case is reproducible independently
+	// of CUDA mixed-precision scaling. No evaluation may catch it for us.
+	t.Setenv("WALDO_TRANSFORMERS_DEVICE", "cpu")
+	for _, steps := range []int64{2, 3} {
+		t.Run(fmt.Sprintf("steps-%d", steps), func(t *testing.T) {
+			compose, _, err := model.LoadCompose("../../docs/examples/transformers-smoke.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage := &compose.Stages[0]
+			stage.Corpora = model.NewCorpusSelections([]string{"example"})
+			zero := 0.0
+			stage.Parameters.EvaluationFraction = &zero
+			stage.Parameters.Steps = steps
+			stage.Parameters.SequenceLength = 8
+			stage.Parameters.BatchSize = 1
+			stage.Parameters.LearningRate = 1e20
+			stage.Parameters.Trainer.Arguments["learning_rate"] = 1e20
+			stage.Parameters.Trainer.Arguments["per_device_train_batch_size"] = 1
+			root := t.TempDir()
+			_, err = (model.Builder{Root: root}).Compose(t.Context(), "divergent", compose, []model.PreparedStage{hfPrepared(t, *stage)})
+			if err == nil || !strings.Contains(err.Error(), "non-finite") {
+				t.Fatalf("expected non-finite rejection: %v", err)
+			}
+			t.Logf("rejected: %v", err)
+			if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.Name() == "model.safetensors" {
+					t.Errorf("divergent training published weights: %s", path)
 				}
 				return nil
 			}); err != nil {
