@@ -55,6 +55,46 @@ class DeviceValidationTests(unittest.TestCase):
         self.assertEqual(result["parameters"], 500)
         self.assertEqual(result["active_parameters_estimate"], 300)
 
+    def test_unavailable_device_and_allocation_failure(self):
+        self.torch.cuda.is_available = lambda: False
+        with self.assertRaisesRegex(ValueError, "visible"):
+            worker.validate_device(self.torch, self.facts)
+        self.torch.cuda.is_available = lambda: True
+        with patch.object(self.torch, "tensor", side_effect=RuntimeError("CUDA allocation failed")):
+            with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                worker.validate_device(self.torch, self.facts)
+        with patch.dict(worker.os.environ, WORLD_SIZE="2"):
+            with self.assertRaisesRegex(ValueError, "one CPU process or one GPU"):
+                worker.validate_device(self.torch, self.facts)
+
+
+class TokenizerConfigurationTests(unittest.TestCase):
+    def test_special_ids_for_byte_and_hf(self):
+        for spec in [dict(name="byte", pad_id=0, bos_id=1, eos_id=2),
+                     dict(name="huggingface", huggingface={}, pad_id=0, bos_id=-1, eos_id=2)]:
+            values = {name + "_token_id": None if spec[name + "_id"] == -1 else spec[name + "_id"] for name in ("pad", "bos", "eos")}
+            worker.validate_tokenizer_configuration(types.SimpleNamespace(**values), spec)
+            for name in values:
+                for invalid in [99, None]:
+                    if invalid == values[name]:
+                        continue
+                    with self.subTest(tokenizer=spec["name"], field=name, value=invalid), self.assertRaisesRegex(ValueError, "differs from tokenizer"):
+                        worker.validate_tokenizer_configuration(types.SimpleNamespace(**dict(values, **{name: invalid})), spec)
+
+    def test_unknown_and_incompatible_configuration(self):
+        class Config:
+            def __init__(self, **values):
+                self.model_type = values.get("model_type", "llama")
+            def to_dict(self):
+                return dict(model_type=self.model_type)
+        package = types.SimpleNamespace(LlamaConfig=Config)
+        spec = dict(model_class="LlamaForCausalLM", config_class="LlamaConfig", config={"unknown": 1})
+        with self.assertRaisesRegex(ValueError, "unknown architecture.config"):
+            worker.configuration(package, spec)
+        spec["config"] = dict(model_type="qwen3")
+        with self.assertRaisesRegex(ValueError, "model_type"):
+            worker.configuration(package, spec)
+
 
 class TransformersStreamTests(unittest.TestCase):
     def test_eos_shift_mask_and_cross_corpus_packing(self):
@@ -141,6 +181,16 @@ class PackageVerificationTests(unittest.TestCase):
     def test_bad_wheel_hash(self):
         self.pin["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "SHA-256"):
+            worker.verify_package(self.wheel, self.pin)
+
+    def test_wrong_wheel_filename(self):
+        self.wheel = self.wheel.rename(self.root / "other.whl")
+        with self.assertRaisesRegex(ValueError, "filename"):
+            worker.verify_package(self.wheel, self.pin)
+
+    def test_installed_version_mismatch(self):
+        worker.importlib.metadata.distribution("transformers").version = "5.16.0"
+        with self.assertRaisesRegex(ValueError, "installed Transformers version"):
             worker.verify_package(self.wheel, self.pin)
 
     def test_installed_source_tampering(self):

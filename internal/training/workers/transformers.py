@@ -18,7 +18,7 @@ import tempfile
 import traceback
 import zipfile
 
-REVISION = "builtin-transformers-worker-schema-1-r3"
+REVISION = "builtin-transformers-worker-schema-1-r4"
 PROTOCOL_OUTPUT = sys.stdout
 
 
@@ -162,6 +162,13 @@ def configuration(transformers, spec):
     return config
 
 
+def validate_tokenizer_configuration(config, tokenizer):
+    for name in ("pad", "bos", "eos"):
+        expected = tokenizer[name + "_id"]
+        if getattr(config, name + "_token_id", None) != (None if expected == -1 else expected):
+            raise ValueError(f"model config {name} ID differs from tokenizer framing")
+
+
 def runtime_facts(device="cpu"):
     dependencies = {name: importlib.metadata.version(name) for name in ("torch", "transformers", "accelerate", "safetensors", "tokenizers")}
     return dict(python=platform.python_version(), dependencies=dependencies, device=device, worker=REVISION)
@@ -283,11 +290,8 @@ def run():
     trainer_spec = parameters["trainer"]
     device = validate_device(torch, device_facts, trainer_spec["arguments"], spec["config"].get("dtype", "float32"))
     config = configuration(transformers, spec)
+    validate_tokenizer_configuration(config, begin["tokenizer"])
     if begin["tokenizer"].get("huggingface"):
-        for name in ("pad", "bos", "eos"):
-            expected = begin["tokenizer"][name + "_id"]
-            if getattr(config, name + "_token_id", None) != (None if expected == -1 else expected):
-                raise ValueError(f"model config {name} ID differs from tokenizer framing")
         # Verify the assets before training, and again when saving the artifact.
         with pinned_tokenizer(transformers, begin["tokenizer"], os.environ["WALDO_HF_TOKENIZER_DIR"]):
             pass

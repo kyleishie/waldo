@@ -17,7 +17,7 @@ import (
 )
 
 const BackendTransformers = "huggingface-transformers"
-const TransformersRevision = "builtin-transformers-worker-schema-1-r3"
+const TransformersRevision = "builtin-transformers-worker-schema-1-r4"
 
 //go:embed transformers_models.json
 var transformersModelsJSON string

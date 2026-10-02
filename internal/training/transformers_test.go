@@ -6,9 +6,29 @@ package training
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestTransformersUnavailableDeviceProbe(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("Python required for subprocess probe test")
+	}
+	directory := t.TempDir()
+	// Execute the actual probe with a minimal CPU-only torch stand-in.
+	if err := os.WriteFile(filepath.Join(directory, "torch.py"), []byte("__version__ = 'test'\nclass CUDA:\n    def is_available(self): return False\ncuda = CUDA()\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PYTHONPATH", directory)
+	t.Setenv("WALDO_TRANSFORMERS_DEVICE", "cuda")
+	if _, err := ProbeTransformersDevice(t.Context(), python); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("unavailable CUDA: %v", err)
+	}
+}
 
 func TestTransformersDoesNotOverrideExplicitHostPolicy(t *testing.T) {
 	request := ResolveRequest{Architecture: json.RawMessage(`{"family":"huggingface-transformers"}`)}

@@ -159,6 +159,13 @@ retained source-run artifact, requires config/tokenizer evidence, and checks HF
 tokenizer hashes against architecture pins. Both tokenizer lifecycle tests passed
 on CUDA after the fix, including independent export parity and tamper rejection.
 
+Failure-path coverage includes byte/HF special-ID validation, package filename
+and installed-version mismatches, unavailable CUDA/allocation failures, and
+subprocess-backed HF chat cancellation, callback failure, malformed/oversized
+output, abrupt exits, diagnostics, and process reaping. Run the opt-in
+`TestTransformersRejectsByteSpecialIDs` model test with the pinned runtime to
+verify that incompatible byte configurations fail before producing weights.
+
 ### External services
 
 Live tests are never run by `testing/all.sh`. Their environment variables are

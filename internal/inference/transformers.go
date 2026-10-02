@@ -5,6 +5,7 @@ package inference
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/base64"
@@ -38,6 +39,32 @@ type transformersSession struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	closed  bool
+	exitErr error // Published before frames is closed.
+}
+
+// Keep worker diagnostics bounded and safe while os/exec drains stderr.
+type transformersDiagnostics struct {
+	mu   sync.Mutex
+	data bytes.Buffer
+}
+
+func (d *transformersDiagnostics) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := len(p)
+	if remaining := 65536 - d.data.Len(); remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		d.data.Write(p)
+	}
+	return n, nil
+}
+
+func (d *transformersDiagnostics) String() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return strings.TrimSpace(d.data.String())
 }
 
 func transformersArtifacts(inspection model.Inspection) (map[string]string, error) {
@@ -96,63 +123,105 @@ func openTransformers(ctx context.Context, inspection model.Inspection) (Opened,
 	}
 	support, _ := json.Marshal(training.TransformersPythonSupport())
 	program := "support = {'__name__': 'waldo_transformers_support'}\nexec(" + string(support) + ", support)\n" + transformersChatWorker
+	session, err := startTransformersSession(ctx, python, []string{"-c", program, string(payload)}, int(inspection.Model.Architecture.ContextTokens))
+	if err != nil {
+		return Opened{}, err
+	}
+	return Opened{Session: session, Description: Description{Model: inspection.Model.Name, SourceType: "run", SourceID: inspection.BOM.CurrentRunID, RunID: inspection.BOM.CurrentRunID, Backend: training.BackendTransformers, ContextTokens: int(inspection.Model.Architecture.ContextTokens)}}, nil
+}
+
+func startTransformersSession(ctx context.Context, executable string, arguments []string, expectedContext int) (*transformersSession, error) {
 	processCtx, cancel := context.WithCancel(ctx)
 	session := &transformersSession{cancel: cancel, frames: make(chan transformersFrame), done: make(chan struct{})}
-	session.command = exec.CommandContext(processCtx, python, "-c", program, string(payload))
-	session.command.Stderr = io.Discard // Worker errors travel over the bounded JSON protocol.
+	session.command = exec.CommandContext(processCtx, executable, arguments...)
+	var diagnostics transformersDiagnostics
+	session.command.Stderr = &diagnostics
+	session.command.WaitDelay = 5 * time.Second
+	var err error
 	session.input, err = session.command.StdinPipe()
 	if err != nil {
 		cancel()
-		return Opened{}, err
+		return nil, err
 	}
 	output, err := session.command.StdoutPipe()
 	if err != nil {
 		session.input.Close()
 		cancel()
-		return Opened{}, err
+		return nil, err
 	}
 	session.encoder = json.NewEncoder(session.input)
 	if err := session.command.Start(); err != nil {
 		session.input.Close()
 		output.Close()
 		cancel()
-		return Opened{}, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
 	}
 	go func() {
 		defer close(session.done)
 		defer close(session.frames)
 		scanner := bufio.NewScanner(output)
 		scanner.Buffer(make([]byte, 65536), 1024*1024)
+		var readErr error
+	readFrames:
 		for scanner.Scan() {
 			var frame workerFrame
 			err := json.Unmarshal(scanner.Bytes(), &frame)
 			if err == nil && frame.Schema != 1 {
 				err = fmt.Errorf("invalid Transformers chat protocol")
 			}
+			if err != nil {
+				readErr = err
+				break
+			}
 			select {
 			case session.frames <- transformersFrame{frame, err}:
 			case <-processCtx.Done():
-				return
+				break readFrames
 			}
 		}
+		if readErr == nil {
+			readErr = scanner.Err()
+		}
+		// EOF or malformed output terminates the session. Reap even when callers
+		// have not called Close yet; no further requests can be processed safely.
+		cancel()
+		waitErr := session.command.Wait()
+		session.exitErr = fmt.Errorf("Transformers chat worker exited (read: %v; process: %v): %s", readErr, waitErr, diagnostics.String())
 	}()
 	readyCtx, stop := context.WithTimeout(ctx, 60*time.Second)
 	defer stop()
 	frame, err := session.next(readyCtx)
-	if err != nil || frame.Kind != "ready" || frame.Context != int(inspection.Model.Architecture.ContextTokens) {
+	if err != nil || frame.Kind != "ready" || frame.Context != expectedContext {
 		session.Close()
-		return Opened{}, fmt.Errorf("initialize Transformers chat: %v (%s)", err, frame.Error)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Transformers chat: %w", err)
+		}
+		return nil, fmt.Errorf("initialize Transformers chat: invalid ready frame (%s)", frame.Error)
 	}
-	return Opened{Session: session, Description: Description{Model: inspection.Model.Name, SourceType: "run", SourceID: inspection.BOM.CurrentRunID, RunID: inspection.BOM.CurrentRunID, Backend: training.BackendTransformers, ContextTokens: frame.Context}}, nil
+	return session, nil
 }
 
 func (s *transformersSession) next(ctx context.Context) (workerFrame, error) {
+	if err := ctx.Err(); err != nil {
+		s.cancel()
+		return workerFrame{}, err
+	}
 	select {
 	case <-ctx.Done():
 		s.cancel()
 		return workerFrame{}, ctx.Err()
 	case item, ok := <-s.frames:
+		if err := ctx.Err(); err != nil {
+			s.cancel()
+			return workerFrame{}, err
+		}
 		if !ok {
+			if s.exitErr != nil {
+				return workerFrame{}, s.exitErr
+			}
 			return workerFrame{}, fmt.Errorf("Transformers chat worker exited")
 		}
 		if item.frame.Kind == "error" {
@@ -178,6 +247,9 @@ func (s *transformersSession) Generate(ctx context.Context, prompt string, optio
 	defer stop()
 	if err := s.encoder.Encode(map[string]any{"kind": "generate", "schema": 1, "prompt": prompt, "options": options}); err != nil {
 		s.cancel()
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
 		return Result{}, err
 	}
 	var text strings.Builder
@@ -220,6 +292,5 @@ func (s *transformersSession) Close() error {
 	s.closed = true
 	s.input.Close()
 	<-s.done
-	_ = s.command.Wait()
 	return nil
 }
