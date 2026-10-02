@@ -165,7 +165,8 @@ export WALDO_TRANSFORMERS_WHEEL=/absolute/path/to/transformers-5.16.1-py3-none-a
 The environment needs the pinned wheel installed plus compatible `torch` and
 `accelerate` dependencies. `model.backend=auto` selects this adapter from the
 compose engine; an explicit `fake`, `mlx`, or `torchtitan` preference conflicts
-and fails. The initial implementation does not use a GPU even on GPU hosts.
+and fails. The adapter supports CPU or one visible CUDA/ROCm GPU; explicit
+GPU selection fails rather than falling back to CPU when unavailable.
 The worker hashes the local wheel, checks the installed distribution version,
 compares installed package files with wheel contents, and compiles verified
 source rather than trusting bytecode caches. It repeats verification at run

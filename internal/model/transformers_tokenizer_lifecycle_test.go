@@ -5,6 +5,7 @@ package model_test
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,42 @@ import (
 	"github.com/openwaldo/waldo/internal/model"
 	"github.com/openwaldo/waldo/internal/modelexport"
 )
+
+func TestTransformersRejectsByteSpecialIDs(t *testing.T) {
+	if os.Getenv("WALDO_TRANSFORMERS_PYTHON") == "" || os.Getenv("WALDO_TRANSFORMERS_WHEEL") == "" {
+		t.Skip("set Transformers Python and wheel")
+	}
+	for _, name := range []string{"pad_token_id", "bos_token_id", "eos_token_id"} {
+		t.Run(name, func(t *testing.T) {
+			compose, _, err := model.LoadCompose("../../docs/examples/transformers-smoke.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "pad_token_id" {
+				delete(compose.Architecture.Transformers.Config, name)
+			} else {
+				compose.Architecture.Transformers.Config[name] = 3
+			}
+			compose.Stages[0].Corpora = model.NewCorpusSelections([]string{"example"})
+			root := t.TempDir()
+			_, err = (model.Builder{Root: root}).Compose(t.Context(), "bad-specials", compose, []model.PreparedStage{hfPrepared(t, compose.Stages[0])})
+			if err == nil || !strings.Contains(err.Error(), "differs from tokenizer framing") {
+				t.Fatalf("expected special-ID rejection: %v", err)
+			}
+			if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.Name() == "model.safetensors" {
+					t.Errorf("invalid config produced weights: %s", path)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 // This opt-in test uses only synthetic corpus data and pinned local assets.
 func TestTransformersTokenizerLifecycle(t *testing.T) {
