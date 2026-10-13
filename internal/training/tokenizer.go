@@ -27,13 +27,13 @@ const (
 )
 
 type TokenizerSpec struct {
-	HuggingFace    *HuggingFaceTokenizer    `json:"huggingface,omitempty"`
 	Name           string                   `json:"name"`
 	Revision       string                   `json:"revision"`
 	VocabularySize int                      `json:"vocabulary_size"`
 	PadID          int                      `json:"pad_id"`
 	BOSID          int                      `json:"bos_id"`
 	EOSID          int                      `json:"eos_id"`
+	HuggingFace    *HuggingFaceTokenizer    `json:"huggingface,omitempty"`
 	Artifact       *waldoTokenizer.Artifact `json:"artifact,omitempty"`
 }
 
@@ -104,7 +104,7 @@ func ResolveTokenizerSpec(spec TokenizerSpec) (TokenizerSpec, TokenCodec, error)
 	if err != nil {
 		return TokenizerSpec{}, nil, err
 	}
-	return spec, codec, nil
+	return spec, localCodecAdapter{codec}, nil
 }
 
 type TokenCodec interface {

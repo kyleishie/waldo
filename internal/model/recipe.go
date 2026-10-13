@@ -141,9 +141,9 @@ type Architecture struct {
 }
 
 type Tokenizer struct {
-	HuggingFace  *training.HuggingFaceTokenizer `json:"huggingface,omitempty" yaml:"huggingface,omitempty"`
 	Name         string                         `json:"name" yaml:"name"`
 	Revision     string                         `json:"revision" yaml:"revision"`
+	HuggingFace  *training.HuggingFaceTokenizer `json:"huggingface,omitempty" yaml:"huggingface,omitempty"`
 	ArtifactPath string                         `json:"-" yaml:"artifact_path,omitempty"`
 	Artifact     *waldotokenizer.Artifact       `json:"artifact,omitempty" yaml:"artifact,omitempty"`
 	Training     *TokenizerTraining             `json:"training,omitempty" yaml:"training,omitempty"`

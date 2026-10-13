@@ -1,4 +1,5 @@
-# Native schema-2 example, mirroring composes/holding/tool-use.yaml.
+# Native schema-2 example, mirroring the historical tool-use compose retained
+# in internal/model/testdata/schema1-tool-use.yaml.
 # Requires a completed managed conversation model with matching architecture.
 #
 # Specialize the completed managed conversation model on reviewed structured

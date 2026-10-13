@@ -15,7 +15,7 @@ import (
 )
 
 func TestSchema2NativeMatchesSchema1(t *testing.T) {
-	legacy, _, err := LoadCompose("../../composes/holding/tool-use.yaml")
+	legacy, _, err := LoadCompose("testdata/schema1-tool-use.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -360,7 +360,6 @@ type Initialization struct {
 }
 
 type Request struct {
-	Trainer                *TransformersTrainer `json:"trainer,omitempty" yaml:"trainer,omitempty"`
 	RunID                  string
 	Stage                  string
 	Objective              string
@@ -368,6 +367,7 @@ type Request struct {
 	ArchitectureSHA256     string
 	Architecture           json.RawMessage
 	Tokenizer              TokenizerSpec
+	TokenizerCodec         TokenCodec
 	BOM                    corpus.BOM
 	Inputs                 []Input
 	Parameters             ResolvedParameters

@@ -37,8 +37,16 @@ func TestResolveTokenizerSpecUsesEmbeddedTrainedArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := "hello world"
-	if resolved.Revision != artifact.Revision || codec.Decode(codec.Encode(text)) != text {
-		t.Fatalf("resolved = %+v, round trip = %q", resolved, codec.Decode(codec.Encode(text)))
+	tokens, err := codec.EncodeChecked(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := codec.DecodeChecked(tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Revision != artifact.Revision || decoded != text {
+		t.Fatalf("resolved = %+v, round trip = %q", resolved, decoded)
 	}
 
 	missing := spec
