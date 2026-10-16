@@ -327,7 +327,9 @@ tiktoken-based Transformers chat is not yet supported.
 Sampling supports temperature, top-p, seeds, EOS, streaming, and interaction
 stop strings. Undecodable padded vocabulary rows are excluded. Prompt encoding
 adds no automatic BOS/EOS; an empty prompt requires a declared BOS. Context is
-a sliding window with no KV cache. Generation uses float32 on CPU and the
+a sliding window with no KV cache. Hybrid models likewise retain no recurrent
+state between decoding steps: each step recomputes the current bounded window.
+Generation uses float32 on CPU and the
 configured parameter dtype on GPU; it does not change stored weights.
 `WALDO_TRANSFORMERS_DEVICE=auto|cpu|cuda` uses the same verified hardware
 selection as training. Cancellation terminates the session worker.

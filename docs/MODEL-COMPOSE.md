@@ -63,9 +63,34 @@ and expert parameters plus an explicitly defined active-parameter estimate.
 Hybrid forecasts are only dense-decoder proxies, not recurrent-state or memory
 estimates. Use measured runtime counts rather than treating forecasts as exact.
 
+### Supported-feature matrix
+
+This is a bounded integration for the class pairs above, not general support for
+all Transformers models, tasks, Trainer options, or extension points.
+
+| Area | Implemented | Boundary |
+| --- | --- | --- |
+| Initialization | Random weights from explicit config; compatible managed `base.model` | No HF checkpoint import through `base.source` |
+| Objectives | Causal LM and WALDO assistant-response masking | No arbitrary task heads, HF chat-template training, or custom Trainer subclasses |
+| Training | Standard `Trainer`, listed argument allowlist, gradient accumulation, final evaluation and weights | No periodic evaluation/checkpoints, distributed training, or exact optimizer-state resume |
+| Continuation | Verified completed-run weights and the same immutable architecture/tokenizer | New optimizer/scheduler state; not an exact continuation of optimizer history |
+| Tokenizers | Byte, tiktoken training, pinned data-only HF fast tokenizers | Chat and export support byte/HF only; no automatic acquisition or remote tokenizer code |
+| Devices | CPU or one visible CUDA/ROCm GPU; FP16/BF16 training subject to device checks | No Apple MPS or multi-GPU execution; ROCm has not been hardware-validated |
+| Chat | Streaming, temperature/top-p, seed, EOS/stop strings, bounded context, cancellation | No KV/recurrent-state cache, upstream HF chat templates, or multimodal input |
+| Export | Provider-native Hugging Face weights, tokenizer assets, hashed provenance and signing hook | No provider-native conversion to MLX/GGUF/Ollama or quantization |
+| Integrity | Exact Transformers wheel/source verification, artifact and tokenizer hashes | Interpreter and transitive dependencies are trusted, not fully hash-locked |
+
+CPU smoke tests cover the listed families. Single-GPU CUDA lifecycle tests on
+NVIDIA GB10 cover all listed families in FP32; the Mistral/Gemma2/Phi3/OLMo2/
+Mixtral/Qwen3.5 matrix also passed FP16 and BF16 training. The byte/HF tokenizer
+end-to-end matrix uses custom Qwen3 models in FP32. These are tiny-model mechanics
+tests, not evidence of convergence, production-scale capacity, or equivalent
+behavior across every configuration. See [testing evidence and remaining audit
+coverage](TESTING.md#transformers-validation-scope).
+
 The [custom Qwen3 smoke compose](examples/transformers-qwen3-smoke.yaml) uses
 two layers, hidden size 64, intermediate size 160, four attention heads, two KV
-heads, and head dimension 16. It runs two CPU optimizer steps from random weights
+heads, and head dimension 16. It runs two optimizer steps from random weights
 with the byte tokenizer. This tests architecture/config forwarding, not language
 quality or the pretrained Qwen tokenizer. Its measured size is 102,976 parameters.
 
@@ -141,7 +166,7 @@ available CUDA/ROCm device, records its identity/memory, and executes a real
 device operation. Explicit `cuda` fails if unavailable; it never falls back to
 CPU. Select exactly one visible GPU using `CUDA_VISIBLE_DEVICES` (or ROCm's
 equivalent). Multiple visible GPUs and distributed launch are rejected. Apple
-MPS is not implemented; auto uses CPU on this Mac path.
+MPS is not implemented; auto uses CPU on macOS.
 
 Trainer `fp16` and `bf16` options are mutually exclusive and GPU-only here.
 `fp16` scaling requires float32 model parameters. BF16 requires device support.
@@ -172,6 +197,26 @@ compares installed package files with wheel contents, and compiles verified
 source rather than trusting bytecode caches. It repeats verification at run
 startup. This assumes a trusted local Python interpreter, not a hostile runtime.
 Dependencies are version-inventoried but are not transitively wheel-locked.
+See [runtime setup for acceptance tests](TESTING.md#runtime-setup-for-acceptance-tests)
+for the environment prerequisites, pinned wheel checks, and tested DGX stack.
+
+### Reproducibility boundaries
+
+- Preserve the compose, corpus/run BOMs, tokenizer files, exact wheel, and saved
+  artifacts. A version string alone does not identify package or corpus bytes.
+- `runtime.json` records dependency versions and hardware, but is an inventory,
+  not a complete environment lock. Preserve the Python environment or container
+  digest and driver details separately. Container tags can change.
+- Seeds and `full_determinism` do not promise bit-identical results across
+  framework versions, devices, kernels, or precision settings. Exact reload
+  parity tests apply to their tested runtime and fixtures only.
+- Completed-run continuation restores weights, not optimizer/scheduler/RNG state.
+  Interrupted-stage retry is not checkpoint resume. Plan accordingly before
+  expensive training runs.
+- Non-finite objective values and final floating-point tensors fail before final
+  artifacts are published; finite values do not establish model quality.
+- Hashes and signatures establish identity/integrity, not truthful behavior of a
+  hostile interpreter, model usefulness, or license/legal compliance.
 
 Final artifacts include provider-native `model.safetensors`, resolved
 `config.json`, the WALDO `tokenizer.json` descriptor, `training_args.json`, and

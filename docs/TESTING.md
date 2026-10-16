@@ -108,6 +108,54 @@ verifies durable artifacts, and continues the Llama from saved weights with
 gradient accumulation. It performs no model downloads or external publication.
 Tests skip this path unless both variables are set.
 
+#### Runtime setup for acceptance tests
+
+These instructions provision a developer test runtime, not a WALDO-managed
+installation. Start with an isolated Python environment whose PyTorch build
+already works for the intended CPU/CUDA/ROCm device. Driver, CPU architecture,
+PyTorch wheel, and GPU runtime compatibility are machine-local prerequisites;
+installing Transformers does not provision a driver or guarantee GPU support.
+Do not reuse a macOS virtual environment on Linux or an x86 environment on ARM64.
+
+The examples currently pin Transformers 5.16.1. Keep the wheel as well as the
+installed package. With `hf_python` pointing at that chosen isolated interpreter:
+
+```bash
+hf_python=/absolute/path/to/isolated-runtime/bin/python
+hf_wheels=$(mktemp -d)
+"$hf_python" -m pip download --no-deps --dest "$hf_wheels" transformers==5.16.1
+export WALDO_TRANSFORMERS_WHEEL="$hf_wheels/transformers-5.16.1-py3-none-any.whl"
+"$hf_python" -c 'import hashlib, os, pathlib; p = pathlib.Path(os.environ["WALDO_TRANSFORMERS_WHEEL"]); assert hashlib.sha256(p.read_bytes()).hexdigest() == "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e", "wheel hash mismatch"'
+"$hf_python" -m pip install "$WALDO_TRANSFORMERS_WHEEL" accelerate==1.15.0
+export WALDO_TRANSFORMERS_PYTHON="$hf_python"
+```
+
+Package installation can change transitive dependencies. Recheck the installed
+environment and selected device afterward; keep the dependency inventory with
+the test logs. For CPU, explicitly set `WALDO_TRANSFORMERS_DEVICE=cpu`. For CUDA,
+expose one GPU and verify a real allocation before running WALDO:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export WALDO_TRANSFORMERS_DEVICE=cuda
+"$WALDO_TRANSFORMERS_PYTHON" -c 'import torch; assert torch.cuda.is_available(); assert torch.cuda.device_count() == 1; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0)); print(torch.ones(4, device="cuda").sum().item())'
+"$WALDO_TRANSFORMERS_PYTHON" -m pip freeze
+```
+
+The recorded DGX Spark acceptance environment was Linux ARM64, Python 3.12,
+NVIDIA GB10, driver 580.173.02, PyTorch 2.13.0+cu129, Transformers 5.16.1,
+Accelerate 1.15.0, Tokenizers 0.23.2, and Safetensors 0.8.0. It used an existing
+`vllm/vllm-openai:v0.28.0-aarch64-cu129` container with GPU access and an isolated
+`python3 -m venv --system-site-packages` overlay. This records a tested setup,
+not a requirement to install vLLM or a claim that the image tag is immutable.
+The host driver's advertised CUDA 13.0 capability is distinct from the PyTorch
+CUDA 12.9 runtime used by these tests. Revalidate other runtime combinations.
+
+HF tokenizer tests additionally require the local hash-pinned assets described
+below; byte-tokenizer tests do not. WALDO never downloads models, tokenizer
+assets, or dependencies during these tests. For offline execution, provision
+the runtime/wheel and tokenizer assets before disconnecting.
+
 With the same runtime variables set, run the dedicated custom Qwen3 compose test:
 
 ```bash
@@ -212,6 +260,28 @@ checks final floating-point parameters and buffers before saving, since the last
 optimizer update may corrupt them after the last loss calculation. Unicode tests
 check bounded, lossless output frames through both the Python emitter and Go
 reader, plus stop-prefix and incomplete UTF-8 handling.
+
+#### Transformers validation scope
+
+Recorded September/October 2026 acceptance results:
+
+| Check | Evidence | Limitation |
+| --- | --- | --- |
+| Family lifecycle | CPU and GB10 CUDA FP32; six-family CUDA FP16/BF16 matrix | Llama/Qwen2/Qwen3 baseline tests stay FP32; not a production-scale benchmark |
+| Tokenizer lifecycle | Byte and pinned Qwen HF tokenizer: train, continue, stream, export/reload, corruption rejection | Custom Qwen3 FP32 fixtures, not every tokenizer/model/precision combination |
+| Numerical safety | Deliberately divergent no-held-out run rejected; final NaN parameters/Inf buffers rejected | Does not prove convergence or gradient/update parity |
+| Stream and cleanup | Large valid Unicode output, bounded frames, stop prefixes, cancellation, crash/protocol failure and reaping | Large-output runtime probe used the pinned Qwen tokenizer |
+| Export evidence | Artifact hashes and training-run package provenance enter the signing callback | Not an external signing-service integration test |
+| ROCm | Device path implemented | No real ROCm hardware validation yet |
+
+The scoped audit found no further confirmed defect after the fixes, but the
+following numerical/evidence coverage remains open before claiming a complete
+audit: unequal-mask and partial-accumulation gradient/update parity, explicit
+Mixtral auxiliary-gradient checks, Qwen3.5 layer-update and context-rollover
+parity, complete signing-evidence field assertions and HF finalizer-failure
+cleanup, and independent Mixtral/Qwen3.5 export reload parity. Do not replace
+these checks with a successful smoke run or mark them complete based only on
+the implemented-feature matrix.
 
 ### External services
 
