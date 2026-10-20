@@ -80,3 +80,4 @@ Superseded and historical ADRs are removed. Missing numbers are intentional.
 - [0081: Version exact intrinsic-loss telemetry](0081-version-intrinsic-loss-telemetry.md)
 - [0082: Stream training-ready Parquet into token-budget runs](0082-stream-training-ready-parquet.md)
 - [0082: Version the compose execution and architecture envelope](0082-schema2-compose-envelope.md)
+- [0083: Separate portable training engines from host backend policy](0083-portable-training-engines-and-host-backends.md) (proposed)
