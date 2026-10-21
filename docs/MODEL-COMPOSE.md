@@ -315,11 +315,13 @@ requested and resolved revisions, declared license when available, source-file
 hashes, and normalized artifact hashes.
 
 Schema 1 currently accepts standard bias-free Llama Safetensors with
-`OpenWALDOByteTokenizer`, vocabulary size 259, and F32, F16, or BF16 tensors—the
-format produced by WALDO's Hugging Face export. Other tokenizers, architectures,
-tensor layouts, and source providers fail before the destination model is
-published. `base.source` and `model pull` intentionally share this same
-compatibility boundary.
+`OpenWALDOTokenizer`, vocabulary size 259, and F32, F16, or BF16 tensors—the
+format produced by current WALDO Hugging Face exports. Pull also accepts the
+legacy `OpenWALDOByteTokenizer` class name used by older WALDO exports; both
+names identify the same byte tokenizer. Other tokenizers, architectures, tensor
+layouts, and source providers fail before the destination model is published.
+`base.source` and `model pull` intentionally share this same compatibility
+boundary.
 
 ## Architecture fields
 

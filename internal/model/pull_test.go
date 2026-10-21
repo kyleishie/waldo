@@ -32,7 +32,7 @@ func isolateHuggingFaceToken(t *testing.T) {
 func TestDownloadHuggingFaceModelCreatesVerifiedOrigin(t *testing.T) {
 	isolateHuggingFaceToken(t)
 	architecture := Architecture{Family: "decoder-transformer", ContextTokens: 32, VocabularySize: 259, HiddenSize: 4, IntermediateSize: 8, Layers: 1, AttentionHeads: 2, KeyValueHeads: 1, TieEmbeddings: true, ParameterDType: "bfloat16", Tokenizer: Tokenizer{Name: "byte", Revision: "builtin-byte-schema-1"}}
-	files := huggingFaceFixture(t, architecture, "OpenWALDOByteTokenizer")
+	files := huggingFaceFixture(t, architecture, HuggingFaceTokenizerClass)
 	revision := strings.Repeat("a", 40)
 	client := &http.Client{Transport: huggingFaceTransport(t, files, revision)}
 	root := t.TempDir()
@@ -79,7 +79,7 @@ func TestDownloadRejectsUnsupportedTokenizerWithoutPublishing(t *testing.T) {
 	client := &http.Client{Transport: huggingFaceTransport(t, files, strings.Repeat("b", 40))}
 	root := t.TempDir()
 	_, err := (Puller{Root: root, Endpoint: "https://hub.test", Client: client}).Pull(t.Context(), "bad", "huggingface://org/bad@main")
-	if err == nil || !strings.Contains(err.Error(), "currently supports OpenWALDOByteTokenizer") {
+	if err == nil || !strings.Contains(err.Error(), "currently supports OpenWALDOTokenizer") {
 		t.Fatalf("error = %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "bad")); !os.IsNotExist(statErr) {
@@ -87,10 +87,25 @@ func TestDownloadRejectsUnsupportedTokenizerWithoutPublishing(t *testing.T) {
 	}
 }
 
+func TestValidateDownloadedTokenizerAcceptsLegacyClassAlias(t *testing.T) {
+	directory := t.TempDir()
+	configuration, err := json.Marshal(map[string]any{"tokenizer_class": LegacyHuggingFaceTokenizerClass, "pad_token": "<pad>", "bos_token": "<bos>", "eos_token": "<eos>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "tokenizer_config.json"), configuration, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	architecture := Architecture{VocabularySize: 259}
+	if err := validateDownloadedTokenizer(directory, architecture); err != nil {
+		t.Fatalf("legacy exported tokenizer rejected: %v", err)
+	}
+}
+
 func TestComposeAcquiresPinnedHuggingFaceBaseWithoutVisibleModel(t *testing.T) {
 	isolateHuggingFaceToken(t)
 	architecture := Architecture{Family: "decoder-transformer", ContextTokens: 32, VocabularySize: 259, HiddenSize: 4, IntermediateSize: 8, Layers: 1, AttentionHeads: 2, KeyValueHeads: 1, TieEmbeddings: true, ParameterDType: "bfloat16", Tokenizer: Tokenizer{Name: "byte", Revision: "builtin-byte-schema-1"}}
-	files := huggingFaceFixture(t, architecture, "OpenWALDOByteTokenizer")
+	files := huggingFaceFixture(t, architecture, HuggingFaceTokenizerClass)
 	revision := strings.Repeat("c", 40)
 	client := &http.Client{Transport: huggingFaceTransport(t, files, revision)}
 	root := t.TempDir()

@@ -254,10 +254,10 @@ func huggingFaceTokenizerConfiguration(record model.ModelRecord) (map[string]any
 		return nil, "", err
 	}
 	configuration := map[string]any{
-		"auto_map":  map[string]any{"AutoTokenizer": []any{"tokenization_openwaldo.OpenWALDOTokenizer", nil}},
+		"auto_map":  map[string]any{"AutoTokenizer": []any{"tokenization_openwaldo." + model.HuggingFaceTokenizerClass, nil}},
 		"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>",
 		"model_max_length": record.Architecture.ContextTokens,
-		"tokenizer_class":  "OpenWALDOTokenizer",
+		"tokenizer_class":  model.HuggingFaceTokenizerClass,
 	}
 	if interactionTemplate != "" {
 		configuration["chat_template"] = interactionTemplate

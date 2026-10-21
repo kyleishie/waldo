@@ -24,6 +24,11 @@ import (
 	"github.com/openwaldo/waldo/internal/modelweights"
 )
 
+const (
+	HuggingFaceTokenizerClass       = "OpenWALDOTokenizer"
+	LegacyHuggingFaceTokenizerClass = "OpenWALDOByteTokenizer"
+)
+
 type PullProgress struct {
 	Phase   string `json:"phase"`
 	File    string `json:"file,omitempty"`
@@ -399,8 +404,10 @@ func validateDownloadedTokenizer(directory string, architecture Architecture) er
 	if err := readJSON(filepath.Join(directory, "tokenizer_config.json"), &config); err != nil {
 		return err
 	}
-	if config.TokenizerClass != "OpenWALDOByteTokenizer" || config.BOS != "<bos>" || config.EOS != "<eos>" || config.PAD != "<pad>" || architecture.VocabularySize != 259 {
-		return fmt.Errorf("download currently supports OpenWALDOByteTokenizer with vocabulary_size 259; this model uses %q with vocabulary_size %d", config.TokenizerClass, architecture.VocabularySize)
+	// Earlier exports used LegacyHuggingFaceTokenizerClass, which remains an
+	// alias of the same byte-tokenizer implementation in exported modules.
+	if (config.TokenizerClass != HuggingFaceTokenizerClass && config.TokenizerClass != LegacyHuggingFaceTokenizerClass) || config.BOS != "<bos>" || config.EOS != "<eos>" || config.PAD != "<pad>" || architecture.VocabularySize != 259 {
+		return fmt.Errorf("download currently supports %s (or legacy %s) with vocabulary_size 259; this model uses %q with vocabulary_size %d", HuggingFaceTokenizerClass, LegacyHuggingFaceTokenizerClass, config.TokenizerClass, architecture.VocabularySize)
 	}
 	return nil
 }
