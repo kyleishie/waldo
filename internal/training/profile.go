@@ -311,7 +311,9 @@ func resolveParameters(parameters Parameters, steps, requestedTokens int64) (Res
 		resolved.Optimizer = Optimizer{}
 		resolved.Schedule = Schedule{}
 		resolved.CheckpointEvery = 0
-		resolved.EvaluateEvery = 0
+		if parameters.EvaluateEvery == nil {
+			resolved.EvaluateEvery = 0
+		}
 	}
 	return resolved, nil
 }
@@ -330,8 +332,8 @@ func ProjectTrainerParameters(parameters Parameters) (Parameters, error) {
 	if parameters.Optimizer != "" || parameters.Schedule != "" || parameters.WeightDecay != nil || parameters.WarmupSteps != nil || parameters.WarmdownSteps != nil || parameters.MinimumRateRatio != nil || parameters.Compile {
 		return Parameters{}, fmt.Errorf("Transformers optimizer, schedule, and compile settings belong in trainer.arguments or are unsupported")
 	}
-	if (parameters.CheckpointEvery != nil && *parameters.CheckpointEvery != 0) || (parameters.EvaluateEvery != nil && *parameters.EvaluateEvery != 0) {
-		return Parameters{}, fmt.Errorf("Transformers periodic checkpoints/evaluation are not supported yet")
+	if parameters.CheckpointEvery != nil && *parameters.CheckpointEvery != 0 {
+		return Parameters{}, fmt.Errorf("Transformers periodic resumable checkpoints are not supported yet")
 	}
 	execution, err := parameters.Trainer.Execution()
 	if err != nil {

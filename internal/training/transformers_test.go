@@ -123,7 +123,6 @@ func TestTransformersRejectsConflictingOrUnsupportedKnobs(t *testing.T) {
 		"warmdown":        func(p *Parameters) { p.WarmdownSteps = &steps },
 		"minimum rate":    func(p *Parameters) { p.MinimumRateRatio = &ratio },
 		"checkpoints":     func(p *Parameters) { p.CheckpointEvery = &every },
-		"evaluation":      func(p *Parameters) { p.EvaluateEvery = &every },
 		"fp16 and bf16":   func(p *Parameters) { p.Trainer.Arguments["bf16"] = true },
 		"fractional":      func(p *Parameters) { p.Trainer.Arguments["per_device_train_batch_size"] = 1.5 },
 		"string bool":     func(p *Parameters) { p.Trainer.Arguments["fp16"] = "yes" },
@@ -144,6 +143,19 @@ func TestTransformersRejectsConflictingOrUnsupportedKnobs(t *testing.T) {
 	}
 	if err := ValidateTransformersPrecision("bfloat16", "float16"); err == nil {
 		t.Fatal("bf16 accepted with float16 parameters")
+	}
+}
+
+func TestTransformersEvaluationCadenceIsOptIn(t *testing.T) {
+	parameters := trainerParameters(map[string]any{"per_device_train_batch_size": 1, "learning_rate": .001})
+	resolved, err := ResolveParameters(parameters)
+	if err != nil || resolved.EvaluateEvery != 0 || resolved.CheckpointEvery != 0 {
+		t.Fatalf("default Transformers cadence = evaluate %d checkpoint %d: %v", resolved.EvaluateEvery, resolved.CheckpointEvery, err)
+	}
+	every := int64(1)
+	parameters.EvaluateEvery = &every
+	if resolved, err = ResolveParameters(parameters); err != nil || resolved.EvaluateEvery != 1 || resolved.CheckpointEvery != 0 {
+		t.Fatalf("periodic Transformers evaluation = %d checkpoint %d: %v", resolved.EvaluateEvery, resolved.CheckpointEvery, err)
 	}
 }
 

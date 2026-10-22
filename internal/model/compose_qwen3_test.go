@@ -57,7 +57,9 @@ func TestTransformersQwen3Smoke(t *testing.T) {
 		t.Fatal("Qwen3 compose did not complete one run")
 	}
 	observation := inspection.Runs[0].Observation
-	if observation == nil || observation.Simulated || observation.Steps != 2 || observation.ConsumedTokens != 128 || observation.FinalLoss == nil || len(observation.Evaluations) != 1 {
+	if observation == nil || observation.Simulated || observation.Steps != 2 || observation.ConsumedTokens != 128 || observation.FinalLoss == nil ||
+		// Step 1 and the terminal step are ADR 0044 safety evaluations.
+		len(observation.Evaluations) != 2 || len(observation.Checkpoints) != 2 || observation.SelectedCheckpoint == nil {
 		t.Fatalf("unexpected Qwen3 training evidence: %+v", observation)
 	}
 	run := inspection.RunBOMs[0]

@@ -75,8 +75,8 @@ func normalizeTransformersCompose(data []byte) ([]byte, error) {
 			native.Optimizer != "" || native.Schedule != "" || native.WeightDecay != nil || native.WarmupSteps != nil || native.WarmdownSteps != nil || native.MinimumRateRatio != nil {
 			return nil, fmt.Errorf("stage %s: Transformers batch, accumulation, learning-rate, precision, recomputation, optimizer, and schedule settings belong in stage.trainer.arguments; compile is unsupported", stage.Name)
 		}
-		if native.CheckpointEvery != nil || native.EvaluateEvery != nil {
-			return nil, fmt.Errorf("stage %s: Transformers checkpoint/evaluation scheduling is not supported yet", stage.Name)
+		if native.CheckpointEvery != nil {
+			return nil, fmt.Errorf("stage %s: Transformers periodic resumable checkpoints are not supported yet", stage.Name)
 		}
 		execution, err := item.Trainer.Execution()
 		if err != nil {
@@ -85,8 +85,13 @@ func normalizeTransformersCompose(data []byte) ([]byte, error) {
 		if err := training.ValidateTransformersPrecision(execution.ComputePrecision, architecture.ParameterDType); err != nil {
 			return nil, fmt.Errorf("stage %s: %w", stage.Name, err)
 		}
+		// Step 1 and the terminal step are always safety evaluations when a
+		// held-out set exists; evaluate_every only adds periodic candidates.
 		zero := int64(0)
-		stage.Parameters.CheckpointEvery, stage.Parameters.EvaluateEvery = &zero, &zero
+		stage.Parameters.CheckpointEvery = &zero
+		if stage.Parameters.EvaluateEvery == nil {
+			stage.Parameters.EvaluateEvery = &zero
+		}
 		stage.Parameters.Trainer = &item.Trainer
 		compose.Stages = append(compose.Stages, stage)
 	}

@@ -299,5 +299,65 @@ class TrainerPlanTests(unittest.TestCase):
             worker.validate_device(torch, facts, dict(bf16=True), "float16")
 
 
+class PublicationSafetyTests(unittest.TestCase):
+    """ADR 0044/0079 decisions that do not need a real model."""
+
+    def candidate(self, step, loss, tokens=None):
+        tokens = step * 64 if tokens is None else tokens
+        return dict(step=step, tokens=tokens, metrics=dict(heldout_loss=loss)), dict(step=step, tokens=step * 64, artifacts=[{}])
+
+    def history(self, *losses):
+        pairs = [self.candidate(step, loss) for step, loss in enumerate(losses, start=1)]
+        return [evaluation for evaluation, _ in pairs], [checkpoint for _, checkpoint in pairs]
+
+    def test_worse_final_candidate_does_not_replace_earlier_best(self):
+        evaluations, checkpoints = self.history(2.0, 1.25, 1.75)
+        selected, checkpoint = worker.select_candidate(evaluations, checkpoints)
+        self.assertEqual((selected["step"], checkpoint["step"]), (2, 2))
+
+    def test_ties_select_the_earliest_candidate(self):
+        evaluations, checkpoints = self.history(1.5, 1.0, 1.0)
+        self.assertEqual(worker.select_candidate(list(reversed(evaluations)), checkpoints)[0]["step"], 2)
+
+    def test_only_persisted_consistent_candidates_are_eligible(self):
+        evaluations, checkpoints = self.history(1.0, 2.0)
+        self.assertEqual(worker.select_candidate(evaluations, checkpoints[1:])[0]["step"], 2)
+        with self.assertRaises(worker.ArtifactIntegrityError):
+            worker.select_candidate(evaluations, [])
+        evaluations[1]["tokens"] = 1
+        with self.assertRaisesRegex(worker.ArtifactIntegrityError, "inconsistent"):
+            worker.select_candidate(evaluations, checkpoints)
+        evaluations, checkpoints = self.history(1.0, math.nan)
+        with self.assertRaisesRegex(worker.ArtifactIntegrityError, "inconsistent"):
+            worker.select_candidate(evaluations, checkpoints)
+
+    def test_agreement_tolerance_fails_closed(self):
+        self.assertEqual(worker.loss_tolerance(1.0), 0.02)
+        self.assertEqual(worker.loss_tolerance(-5.0), 0.05)
+        worker.check_agreement(5.04, 5.0, "candidate", "fix")
+        for value, reference in [(5.06, 5.0), (1.03, 1.0), (math.nan, 1.0), (math.inf, 1.0), (1.0, math.nan)]:
+            with self.subTest(value=value, reference=reference), self.assertRaises(worker.ArtifactIntegrityError):
+                worker.check_agreement(value, reference, "candidate", "fix")
+
+    def test_nonfinite_gradient_norm_fails_before_update(self):
+        self.assertEqual(worker.checked_gradient_norm(types.SimpleNamespace(item=lambda: 0.5), 1), 0.5)
+        self.assertEqual(worker.checked_gradient_norm(2, 1), 2.0)
+        for value in [math.nan, math.inf, -math.inf]:
+            with self.subTest(value=value), self.assertRaisesRegex(worker.NumericalIntegrityError, "optimizer step 3"):
+                worker.checked_gradient_norm(value, 3)
+
+    def test_safety_and_periodic_boundaries(self):
+        self.assertEqual([step for step in range(1, 8) if worker.evaluation_due(step, 7, 0)], [1, 7])
+        self.assertEqual([step for step in range(1, 8) if worker.evaluation_due(step, 7, 3)], [1, 3, 6, 7])
+
+    def test_live_parameters_are_separated_from_autocast(self):
+        model = types.SimpleNamespace(forward="autocast", _original_forward="eager")
+        with worker.without_autocast(model):
+            self.assertEqual(model.forward, "eager")
+        self.assertEqual(model.forward, "autocast")
+        with self.assertRaises(worker.ArtifactIntegrityError), worker.without_autocast(types.SimpleNamespace(forward="autocast")):
+            pass
+
+
 if __name__ == "__main__":
     unittest.main()

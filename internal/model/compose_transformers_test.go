@@ -5,8 +5,12 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -422,4 +426,296 @@ func TestTransformersRealTrainerResolution(t *testing.T) {
 			t.Fatalf("executed %+v", evidence.Execution)
 		}
 	})
+}
+
+type transformersIdentityBackend struct{ trainerResolvingBackend }
+
+func (backend transformersIdentityBackend) Descriptor() training.Descriptor {
+	descriptor := backend.trainerResolvingBackend.Descriptor()
+	descriptor.Identity = training.Identity{Name: training.BackendTransformers, Revision: training.TransformersRevision}
+	descriptor.Framework = training.BackendTransformers
+	return descriptor
+}
+
+// ADR 0044/0079 completion evidence is enforced for Transformers exactly as for
+// the native real backends: the published artifact must be the verified best
+// persisted candidate, even when the final step regressed.
+func TestTransformersCompletionRequiresVerifiedBestCandidate(t *testing.T) {
+	writeArtifact := func(t *testing.T, directory, name string) training.Artifact {
+		t.Helper()
+		path := filepath.Join(directory, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte(name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(data)
+		return training.Artifact{Path: "artifacts/" + name, SHA256: hex.EncodeToString(digest[:]), Bytes: int64(len(data))}
+	}
+	// The final step (2) regressed; step 1 is the best persisted candidate.
+	observation := func(t *testing.T, request training.Request) training.Observation {
+		tokens := request.Parameters.PlannedTokenCapacity
+		return training.Observation{
+			Steps: request.Parameters.Steps, ConsumedTokens: tokens,
+			Checkpoints: []training.Checkpoint{
+				{Step: 1, Tokens: tokens / 2, Artifacts: []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000001/model.safetensors")}},
+				{Step: 2, Tokens: tokens, Artifacts: []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000002/model.safetensors")}},
+			},
+			Evaluations: []training.Evaluation{
+				{Step: 1, Tokens: tokens / 2, Metrics: map[string]float64{"heldout_loss": 1.0, "artifact_heldout_loss": 1.001}},
+				{Step: 2, Tokens: tokens, Metrics: map[string]float64{"heldout_loss": 1.5}},
+			},
+			SelectedCheckpoint: &training.CheckpointSelection{Step: 1, Tokens: tokens / 2, Metric: "heldout_loss", Value: 1.0},
+			Artifacts:          []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "model.safetensors")},
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*training.Observation)
+		want   string
+	}{
+		{name: "valid"},
+		{name: "final replaces best", mutate: func(value *training.Observation) {
+			value.SelectedCheckpoint = &training.CheckpointSelection{Step: 2, Tokens: value.ConsumedTokens, Metric: "heldout_loss", Value: 1.5}
+			value.Evaluations[1].Metrics["artifact_heldout_loss"] = 1.5
+		}, want: "not the best"},
+		{name: "missing selection", mutate: func(value *training.Observation) { value.SelectedCheckpoint = nil }, want: "did not identify"},
+		{name: "missing verification", mutate: func(value *training.Observation) { delete(value.Evaluations[0].Metrics, "artifact_heldout_loss") }, want: "does not verify"},
+		{name: "serialization drift", mutate: func(value *training.Observation) { value.Evaluations[0].Metrics["artifact_heldout_loss"] = 1.5 }, want: "does not verify"},
+		{name: "unpersisted selection", mutate: func(value *training.Observation) { value.Checkpoints = value.Checkpoints[1:] }, want: "persisted checkpoint"},
+		{name: "missing evaluations", mutate: func(value *training.Observation) {
+			value.Evaluations, value.SelectedCheckpoint = nil, nil
+		}, want: "no metrics"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			compose, _, err := LoadCompose("../../docs/examples/transformers-smoke.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			compose.Stages[0].Corpora = NewCorpusSelections([]string{"example"})
+			backend := transformersIdentityBackend{trainerResolvingBackend{
+				backendFunc: func(_ context.Context, request training.Request) (training.Observation, error) {
+					if request.EvaluationSet.Records == 0 {
+						t.Fatal("fixture has no held-out set")
+					}
+					value := observation(t, request)
+					if test.mutate != nil {
+						test.mutate(&value)
+					}
+					return value, nil
+				},
+				resolve: func(parameters training.ResolvedParameters) (training.ResolvedParameters, error) {
+					return parameters.WithTrainerResolution(pinnedTrainerResolution(parameters, 0))
+				},
+			}}
+			root := t.TempDir()
+			builder := Builder{Root: root, Resolver: training.ResolverFunc(func(context.Context, training.ResolveRequest) (training.Selection, error) {
+				return testSelection(backend), nil
+			})}
+			inspection, err := builder.Compose(context.Background(), "selection", compose, []PreparedStage{preparedFixture(t, compose.Stages[0])})
+			if test.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if selected := inspection.Runs[0].Observation.SelectedCheckpoint; selected == nil || selected.Step != 1 {
+					t.Fatalf("published selection %+v, want the earlier best step 1", selected)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+			failed, inspectErr := Inspect(root, "selection")
+			if inspectErr != nil {
+				t.Fatal(inspectErr)
+			}
+			if run := failed.Runs[len(failed.Runs)-1]; run.State == RunComplete || run.Observation != nil {
+				t.Fatalf("run completed without valid evidence: %+v", run)
+			}
+		})
+	}
+}
+
+func transformersSelectionCompose(t *testing.T, steps int, learningRate string) Compose {
+	t.Helper()
+	data, err := os.ReadFile("../../docs/examples/transformers-smoke.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.Replace(string(data), "steps: 2\n", fmt.Sprintf("steps: %d\n      evaluate_every: 1\n", steps), 1)
+	input = strings.Replace(input, "sequence_length: 32", "sequence_length: 16", 1)
+	input = strings.Replace(input, "learning_rate: 0.001", "learning_rate: "+learningRate, 1)
+	input = strings.Replace(input, "lr_scheduler_type: linear", "lr_scheduler_type: constant", 1)
+	path := filepath.Join(t.TempDir(), "selection.yaml")
+	if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+		t.Fatal(err)
+	}
+	compose, _, err := LoadCompose(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose.Stages[0].Corpora = NewCorpusSelections([]string{"example"})
+	return compose
+}
+
+// Opt-in real CPU test of ADR 0044/0079 publication: every evaluated
+// candidate is persisted and verified, the full budget runs, a regressed final
+// step does not replace the earlier best, and continuation starts from the
+// verified published weights.
+func TestTransformersPublishesVerifiedBestCandidate(t *testing.T) {
+	if os.Getenv("WALDO_TRANSFORMERS_PYTHON") == "" || os.Getenv("WALDO_TRANSFORMERS_WHEEL") == "" {
+		t.Skip("set WALDO_TRANSFORMERS_PYTHON and WALDO_TRANSFORMERS_WHEEL for real Transformers training")
+	}
+	// FP32 CPU is deterministic for this seed; the high constant rate makes the
+	// tiny model overshoot on its final step (held-out 2.97 at step 3, 3.19 at 4).
+	t.Setenv("WALDO_TRANSFORMERS_DEVICE", "cpu")
+	const steps = 4
+	compose := transformersSelectionCompose(t, steps, "0.1")
+	builder := Builder{Root: t.TempDir()}
+	prepared := preparedFixture(t, compose.Stages[0])
+	inspection, err := builder.Compose(context.Background(), "selection", compose, []PreparedStage{prepared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, pin := inspection.Runs[0], inspection.Model.Runs[0]
+	observation := run.Observation
+	if run.State != RunComplete || observation.Steps != steps || inspection.RunBOMs[0].Parameters.EvaluateEvery != 1 {
+		t.Fatalf("expected the complete %d-step budget with periodic evaluation: %+v", steps, observation)
+	}
+	if len(observation.Evaluations) != steps || len(observation.Checkpoints) != steps {
+		t.Fatalf("evaluations %d / candidates %d, want %d each", len(observation.Evaluations), len(observation.Checkpoints), steps)
+	}
+	best := observation.Evaluations[0]
+	for index, evaluation := range observation.Evaluations {
+		metrics := evaluation.Metrics
+		t.Logf("step %d: publishable %.6f, live %.6f, compute %.6f", evaluation.Step, metrics["heldout_loss"], metrics["live_eager_heldout_loss"], metrics["live_eager_compute_heldout_loss"])
+		if evaluation.Step != int64(index+1) || observation.Checkpoints[index].Step != evaluation.Step || observation.Checkpoints[index].Tokens != evaluation.Tokens {
+			t.Fatalf("candidate %d is not a persisted evaluated checkpoint", index)
+		}
+		for _, name := range []string{"publishable_checkpoint_heldout_loss", "live_eager_heldout_loss", "live_eager_compute_heldout_loss", "artifact_loss_delta", "compute_precision_loss_delta"} {
+			if _, ok := metrics[name]; !ok {
+				t.Fatalf("step %d lacks %s", evaluation.Step, name)
+			}
+		}
+		if metrics["heldout_loss"] != metrics["publishable_checkpoint_heldout_loss"] {
+			t.Fatal("selection metric is not the publishable candidate loss")
+		}
+		if metrics["heldout_loss"] < best.Metrics["heldout_loss"] {
+			best = evaluation
+		}
+	}
+	final := observation.Evaluations[steps-1]
+	selected := observation.SelectedCheckpoint
+	if selected == nil || selected.Step != best.Step || selected.Value != best.Metrics["heldout_loss"] {
+		t.Fatalf("selected %+v, want earliest best step %d", selected, best.Step)
+	}
+	if selected.Step == steps || final.Metrics["heldout_loss"] <= selected.Value {
+		t.Fatalf("fixture no longer regresses on the final step; selected %+v final %.6f", selected, final.Metrics["heldout_loss"])
+	}
+	verification := best.Metrics
+	if _, ok := verification["artifact_heldout_loss"]; !ok || math.Abs(verification["serialization_loss_delta"]) > 1e-6 {
+		t.Fatalf("published artifact verification %+v", verification)
+	}
+	if _, ok := final.Metrics["artifact_heldout_loss"]; ok {
+		t.Fatal("the regressed final candidate was verified as the published artifact")
+	}
+	runDirectory := filepath.Join(inspection.Path, "runs", runDirectoryName(pin))
+	published := map[string]training.Artifact{}
+	for _, artifact := range observation.Artifacts {
+		published[artifact.Path] = artifact
+	}
+	weights := published["artifacts/model.safetensors"]
+	selectedCandidate := observation.Checkpoints[selected.Step-1].Artifacts[0]
+	finalCandidate := observation.Checkpoints[steps-1].Artifacts[0]
+	tensors := func(artifact training.Artifact) map[string]string {
+		return safetensorsTensorDigests(t, filepath.Join(runDirectory, filepath.FromSlash(artifact.Path)))
+	}
+	// The terminal file is re-serialized from the selected candidate.
+	if publishedTensors := tensors(weights); !reflect.DeepEqual(publishedTensors, tensors(selectedCandidate)) || reflect.DeepEqual(publishedTensors, tensors(finalCandidate)) {
+		t.Fatalf("published tensors are not the selected step-%d candidate", selected.Step)
+	}
+	data, err := os.ReadFile(filepath.Join(runDirectory, "artifacts", "runtime.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runtime struct {
+		Execution struct {
+			Checks int64 `json:"finite_gradient_norm_checks"`
+		} `json:"execution"`
+	}
+	if err := json.Unmarshal(data, &runtime); err != nil || runtime.Execution.Checks != steps {
+		t.Fatalf("gradient norm checks %d, want one per optimizer step: %v", runtime.Execution.Checks, err)
+	}
+	prepared.Stage.Name = "continuation"
+	continued, err := builder.Train(context.Background(), "selection", prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialization := continued.RunBOMs[1].Initialization
+	if initialization == nil || initialization.SourceRunID != pin.ID || initialization.Artifact.SHA256 != weights.SHA256 {
+		t.Fatalf("continuation initialization %+v, want verified published step-%d weights %s", initialization, selected.Step, weights.SHA256)
+	}
+	t.Logf("continuation initialized from the verified step-%d weights %s", selected.Step, weights.SHA256)
+}
+
+// safetensorsTensorDigests maps tensor names to dtype, shape, and data digests,
+// independent of header key order.
+func safetensorsTensorDigests(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 8 {
+		t.Fatalf("%s is not safetensors", path)
+	}
+	size := binary.LittleEndian.Uint64(data[:8])
+	var header map[string]json.RawMessage
+	if size > uint64(len(data)-8) || json.Unmarshal(data[8:8+size], &header) != nil {
+		t.Fatalf("%s has an invalid safetensors header", path)
+	}
+	body := data[8+size:]
+	result := make(map[string]string, len(header))
+	for name, raw := range header {
+		if name == "__metadata__" {
+			continue
+		}
+		var tensor struct {
+			DType   string   `json:"dtype"`
+			Shape   []int64  `json:"shape"`
+			Offsets []uint64 `json:"data_offsets"`
+		}
+		if err := json.Unmarshal(raw, &tensor); err != nil || len(tensor.Offsets) != 2 || tensor.Offsets[0] > tensor.Offsets[1] || tensor.Offsets[1] > uint64(len(body)) {
+			t.Fatalf("%s tensor %s has invalid metadata", path, name)
+		}
+		digest := sha256.Sum256(body[tensor.Offsets[0]:tensor.Offsets[1]])
+		result[name] = fmt.Sprintf("%s%v:%x", tensor.DType, tensor.Shape, digest)
+	}
+	return result
+}
+
+func TestTransformersEvaluationCadenceCompose(t *testing.T) {
+	smoke, _, err := LoadCompose("../../docs/examples/transformers-smoke.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	periodic := transformersSelectionCompose(t, 4, "0.1")
+	for _, test := range []struct {
+		compose Compose
+		want    int64
+	}{{smoke, 0}, {periodic, 1}} {
+		resolved, err := test.compose.Stages[0].ResolveParameters()
+		if err != nil || resolved.EvaluateEvery != test.want || resolved.CheckpointEvery != 0 {
+			t.Fatalf("evaluate_every %d checkpoint_every %d, want %d and 0: %v", resolved.EvaluateEvery, resolved.CheckpointEvery, test.want, err)
+		}
+	}
+	path, err := ArchiveCompose(t.TempDir(), periodic, "periodic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded, _, err := LoadCompose(path); err != nil || !reflect.DeepEqual(loaded, periodic) {
+		t.Fatalf("archived periodic evaluation changed: %v", err)
+	}
 }

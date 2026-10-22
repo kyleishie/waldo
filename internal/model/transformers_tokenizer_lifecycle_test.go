@@ -18,6 +18,7 @@ import (
 	"github.com/openwaldo/waldo/internal/inference"
 	"github.com/openwaldo/waldo/internal/model"
 	"github.com/openwaldo/waldo/internal/modelexport"
+	"github.com/openwaldo/waldo/internal/training"
 )
 
 func TestTransformersRejectsByteSpecialIDs(t *testing.T) {
@@ -85,6 +86,14 @@ func TestTransformersRejectsDivergentTraining(t *testing.T) {
 				t.Fatalf("expected non-finite rejection: %v", err)
 			}
 			t.Logf("rejected: %v", err)
+			// Numerical-integrity failures are terminal, never resumable.
+			inspection, inspectErr := model.Inspect(root, "divergent")
+			if inspectErr != nil {
+				t.Fatal(inspectErr)
+			}
+			if run := inspection.Runs[0]; run.State != model.RunFailed || run.FailureClass != training.WorkerErrorNumericalIntegrity {
+				t.Fatalf("divergent run state %s class %q", run.State, run.FailureClass)
+			}
 			if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 				if err != nil {
 					return err

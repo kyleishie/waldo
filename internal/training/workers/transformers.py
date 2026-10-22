@@ -18,8 +18,16 @@ import tempfile
 import traceback
 import zipfile
 
-REVISION = "builtin-transformers-worker-schema-1-r6"
+REVISION = "builtin-transformers-worker-schema-1-r7"
 PROTOCOL_OUTPUT = sys.stdout
+
+
+class ArtifactIntegrityError(ValueError):
+    """Persisted or precision-converted weights disagree with the live model."""
+
+
+class NumericalIntegrityError(ValueError):
+    """A training loss or optimizer-step gradient norm is not finite."""
 
 
 @contextlib.contextmanager
@@ -295,6 +303,63 @@ def validate_model_finite(model):
                         raise ValueError(f"non-finite model tensor: {name}")
 
 
+def loss_tolerance(reference):
+    """ADR 0044 agreement tolerance: the greater of 0.02 loss or one percent."""
+    return max(0.02, abs(reference) * 0.01)
+
+
+def check_agreement(value, reference, description, remedy):
+    if not math.isfinite(value) or not math.isfinite(reference):
+        raise ArtifactIntegrityError(f"{description} held-out loss is not finite")
+    tolerance = loss_tolerance(reference)
+    if abs(value - reference) > tolerance:
+        raise ArtifactIntegrityError(f"{description} held-out loss {value:.6f} does not match {reference:.6f} within tolerance {tolerance:.6f}; {remedy}")
+
+
+def checked_gradient_norm(value, step):
+    """Fail before the optimizer applies an update from a non-finite gradient."""
+    norm = float(value.item() if hasattr(value, "item") else value)
+    if not math.isfinite(norm):
+        raise NumericalIntegrityError(f"non-finite gradient norm at optimizer step {step}; no optimizer update was applied")
+    return norm
+
+
+def evaluation_due(step, steps, evaluate_every):
+    """Step 1 and the terminal step are safety boundaries; evaluate_every adds periodic ones."""
+    return step == 1 or step == steps or (evaluate_every > 0 and step % evaluate_every == 0)
+
+
+def select_candidate(evaluations, checkpoints):
+    """Lowest persisted publishable held-out loss; ties keep the earliest step.
+
+    The full budget has already run: selection chooses what to publish and is
+    not early stopping.
+    """
+    persisted = {checkpoint["step"]: checkpoint for checkpoint in checkpoints}
+    candidates = sorted((item for item in evaluations if item["step"] in persisted), key=lambda item: item["step"])
+    if not candidates:
+        raise ArtifactIntegrityError("no evaluated candidate checkpoint was persisted")
+    for item in candidates:
+        if persisted[item["step"]]["tokens"] != item["tokens"] or not math.isfinite(item["metrics"]["heldout_loss"]):
+            raise ArtifactIntegrityError(f"candidate evidence at step {item['step']} is inconsistent")
+    selected = min(candidates, key=lambda item: item["metrics"]["heldout_loss"])
+    return selected, persisted[selected["step"]]
+
+
+@contextlib.contextmanager
+def without_autocast(model):
+    """Run the live model without Accelerate's mixed-precision forward wrapper."""
+    original = getattr(model, "_original_forward", None)
+    if original is None:
+        raise ArtifactIntegrityError("cannot separate mixed-precision execution from the live parameters")
+    patched = model.forward
+    model.forward = original
+    try:
+        yield model
+    finally:
+        model.forward = patched
+
+
 def write_json(path, value):
     temporary = str(path) + ".tmp"
     with open(temporary, "w", encoding="utf-8") as stream:
@@ -430,9 +495,8 @@ def run():
                 "_corpora": [x["_corpora"] for x in items]}
 
     consumption = {}
-    evaluation_totals = [0.0, 0]
     expected_dtype = getattr(torch, compute_dtype(parameters, dtype))
-    execution = dict(micro_batches=0, sequences=0, compute_dtypes=set(), head_dtype=None)
+    execution = dict(micro_batches=0, sequences=0, compute_dtypes=set(), head_dtype=None, gradient_norms=0)
 
     # Accelerate converts autocast outputs back to float32, so observe the
     # output head's own result to see the precision that actually executed.
@@ -443,6 +507,14 @@ def run():
         def _get_num_items_in_batch(self, batch_samples, device):
             # Our labels are already shifted, unlike standard causal-LM labels.
             return sum(batch["labels"].ne(-100).sum() for batch in batch_samples).to(device) if batch_samples else None
+
+        def _get_grad_norm(self, model, grad_norm=None):
+            # Trainer computes the (unscaled, pre-clip) norm here immediately
+            # before optimizer.step(), even when max_grad_norm disables clipping.
+            norm = checked_gradient_norm(super()._get_grad_norm(model, grad_norm=grad_norm), self.state.global_step + 1)
+            execution["gradient_norms"] += 1
+            execution["gradient_norm"] = norm
+            return norm
 
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             labels = inputs.pop("labels")
@@ -455,7 +527,7 @@ def run():
             if config.model_type == "mixtral":
                 auxiliary = outputs.aux_loss
                 if auxiliary is None or not torch.isfinite(auxiliary).all():
-                    raise ValueError("Mixtral did not return a finite router auxiliary loss")
+                    raise NumericalIntegrityError("Mixtral did not return a finite router auxiliary loss")
                 # Scale the per-microbatch mean consistently with WALDO's
                 # target-weighted gradient accumulation. Evaluation metrics
                 # below remain pure held-out cross entropy, not router loss.
@@ -464,26 +536,20 @@ def run():
             # Trainer's logging filter can hide NaN/Inf in training_loss.
             # Reject the actual objective before backward, not its logged mean.
             if not torch.isfinite(loss).all().item():
-                raise ValueError("non-finite model loss")
-            if model.training:
-                # Observe what executed, not only what was requested.
-                observed, execution["head_dtype"] = execution["head_dtype"], None
-                if observed != expected_dtype:
-                    raise ValueError(f"Trainer computed {observed}, not the resolved {expected_dtype}")
-                execution["micro_batches"] += 1
-                execution["sequences"] += labels.shape[0]
-                execution["compute_dtypes"].add(str(observed).removeprefix("torch."))
-                for item in counts:
-                    for corpus, count in item.items():
-                        consumption[corpus] = consumption.get(corpus, 0) + count
-            else:
-                evaluation_totals[0] += total.detach().item()
-                evaluation_totals[1] += targets.item()
+                raise NumericalIntegrityError("non-finite model loss")
+            if not model.training:
+                raise ValueError("WALDO evaluates held-out data outside Trainer.compute_loss")
+            # Observe what executed, not only what was requested.
+            observed, execution["head_dtype"] = execution["head_dtype"], None
+            if observed != expected_dtype:
+                raise ValueError(f"Trainer computed {observed}, not the resolved {expected_dtype}")
+            execution["micro_batches"] += 1
+            execution["sequences"] += labels.shape[0]
+            execution["compute_dtypes"].add(str(observed).removeprefix("torch."))
+            for item in counts:
+                for corpus, count in item.items():
+                    consumption[corpus] = consumption.get(corpus, 0) + count
             return (loss, outputs) if return_outputs else loss
-
-    class Progress(transformers.TrainerCallback):
-        def on_step_end(self, args, state, control, **kwargs):
-            emit("event", event=dict(kind="progress", step=state.global_step, tokens=sum(consumption.values()), message=f"Transformers step {state.global_step}/{parameters['steps']}"))
 
     args = training_arguments(transformers, parameters, device, directory / "trainer")
     check_trainer_plan(args, parameters, device)
@@ -492,31 +558,136 @@ def run():
         raise ValueError("run BOM is missing the pinned Trainer resolution")
     if not same_value(trainer_resolution(args, parameters, sorted(pinned["arguments"])), pinned):
         raise ValueError("Trainer arguments differ from the pinned resolution in the run BOM")
+
+    evaluation = list(pack(evaluation_records, continuous=False))
+    if len(evaluation_records) != begin["evaluation_set"]["records"]:
+        raise ValueError(f"evaluation stream has {len(evaluation_records)} records; run BOM pins {begin['evaluation_set']['records']}")
+    if evaluation_records and not evaluation:
+        raise ValueError("held-out records produced no scored evaluation targets")
+    mixed_precision = bool(args.fp16 or args.bf16)
+    publication_dtype = dtype if device == "cuda" else "float32"
+    evaluations, checkpoints = [], []
+
+    def heldout_loss(target):
+        """Held-out cross entropy over WALDO's pinned evaluation windows."""
+        was_training = target.training
+        target.eval()
+        total, count = 0.0, 0
+        try:
+            with torch.no_grad():
+                for offset in range(0, len(evaluation), args.per_device_eval_batch_size):
+                    batch = collate(evaluation[offset:offset + args.per_device_eval_batch_size])
+                    labels = batch["labels"].to(device)
+                    outputs = target(input_ids=batch["input_ids"].to(device), attention_mask=batch["attention_mask"].to(device), use_cache=False)
+                    total += torch.nn.functional.cross_entropy(outputs.logits.float().reshape(-1, config.vocab_size), labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+                    count += labels.ne(-100).sum().item()
+        finally:
+            target.train(was_training)
+        return total / count
+
+    def construct(target_dtype):
+        """Build a fresh model exactly as chat does, without perturbing training RNG."""
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()] if device == "cuda" else []):
+            fresh = getattr(transformers, spec["model_class"])(getattr(transformers, spec["config_class"])(**json.loads(json.dumps(config.to_dict()))))
+        return fresh.to(device=device, dtype=getattr(torch, target_dtype))
+
+    def reload_heldout_loss(path):
+        # Chat reloads config.json and model.safetensors into a new model in
+        # the parameter dtype on CUDA, FP32 on CPU, eager and without autocast.
+        reloaded = construct(publication_dtype)
+        load_model(reloaded, str(path), strict=True)
+        loss = heldout_loss(reloaded)
+        del reloaded
+        return loss
+
+    def save_weights(source, path):
+        temporary = path.with_name(path.name + ".tmp")
+        save_model(source, str(temporary), metadata={"format": "pt", "waldo_backend": "huggingface-transformers", "waldo_architecture_sha256": begin["architecture_sha256"]})
+        os.replace(temporary, path)
+
+    def record_evaluation(step):
+        compute_loss = heldout_loss(model)
+        if mixed_precision:
+            with without_autocast(model):
+                live_loss = heldout_loss(model)
+        else:
+            live_loss = compute_loss
+        if not math.isfinite(compute_loss) or not math.isfinite(live_loss):
+            raise ArtifactIntegrityError(f"live held-out loss at step {step} is not finite")
+        check_agreement(compute_loss, live_loss, f"step {step} {expected_dtype} compute-precision",
+                        "correct compute-precision behavior before spending more compute")
+        tokens = sum(consumption.values())
+        name = f"checkpoints/step-{step:08d}"
+        candidate = directory / name
+        candidate.mkdir(parents=True, exist_ok=False)
+        save_weights(model, candidate / "model.safetensors")
+        publishable = reload_heldout_loss(candidate / "model.safetensors")
+        check_agreement(publishable, live_loss, f"step {step} persisted {publication_dtype} candidate",
+                        "correct checkpoint serialization or dtype conversion before spending more compute")
+        checkpoints.append(dict(step=step, tokens=tokens, artifacts=[dict(path=f"{prefix}/{name}/model.safetensors", sha256=digest(candidate / "model.safetensors"),
+                                                                          bytes=(candidate / "model.safetensors").stat().st_size)]))
+        item = dict(step=step, tokens=tokens, metrics={
+            "heldout_loss": publishable,
+            "heldout_perplexity": math.exp(min(publishable, 80.0)),
+            "live_eager_compute_heldout_loss": compute_loss,
+            "live_eager_heldout_loss": live_loss,
+            "publishable_checkpoint_heldout_loss": publishable,
+            "compute_precision_loss_delta": compute_loss - live_loss,
+            "artifact_loss_delta": publishable - live_loss,
+        })
+        evaluations.append(item)
+        # A log, not a durable evaluation event: these candidates are publication
+        # evidence, not resume points, so an interrupted run restarts cleanly.
+        emit("event", event=dict(kind="log", step=step, tokens=tokens,
+                                 message=f"step {step} publishable held-out loss {publishable:.4f} (live {live_loss:.4f}, compute {compute_loss:.4f})"))
+
+    evaluate_every = parameters.get("evaluate_every", 0)
+
+    class Progress(transformers.TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            emit("event", event=dict(kind="progress", step=state.global_step, tokens=sum(consumption.values()), gradient_norm=execution["gradient_norm"],
+                                     message=f"Transformers step {state.global_step}/{parameters['steps']}"))
+            if evaluation and evaluation_due(state.global_step, parameters["steps"], evaluate_every):
+                record_evaluation(state.global_step)
+
+    directory.mkdir(parents=True, exist_ok=True)
     trainer = WaldoTrainer(model=model, args=args, train_dataset=Dataset(), data_collator=collate, callbacks=[Progress()])
     trainer.model_accepts_loss_kwargs = True
     result = trainer.train()
     if trainer.state.global_step != parameters["steps"]:
         raise ValueError("training stream exhausted before planned optimizer steps")
     if not math.isfinite(result.training_loss):
-        raise ValueError("Transformers reported a non-finite training loss")
+        raise NumericalIntegrityError("Transformers reported a non-finite training loss")
+    if execution["gradient_norms"] != parameters["steps"]:
+        raise NumericalIntegrityError("Trainer did not expose a gradient norm for every optimizer step")
     accumulation = parameters.get("gradient_accumulation_steps", 1)
     if execution["micro_batches"] != parameters["steps"] * accumulation or execution["sequences"] != parameters["steps"] * parameters["batch_size"]:
         raise ValueError("Trainer micro-batches or sequences differ from the resolved global batch and accumulation")
     if bool(getattr(model, "is_gradient_checkpointing", False)) != bool(parameters.get("activation_checkpointing", False)):
         raise ValueError("model gradient checkpointing differs from the resolved plan")
-    evaluations = []
-    evaluation = list(pack(evaluation_records, continuous=False))
-    if evaluation:
-        trainer.evaluate(eval_dataset=evaluation)
-        loss = evaluation_totals[0] / evaluation_totals[1]
-        if not math.isfinite(loss):
-            raise ValueError("Transformers reported a non-finite held-out loss")
-        evaluations.append(dict(step=trainer.state.global_step, tokens=sum(consumption.values()), metrics={"heldout_loss": loss}))
     validate_model_finite(model)
-    directory.mkdir(parents=True, exist_ok=True)
-    temporary = directory / "model.safetensors.tmp"
-    save_model(model, str(temporary), metadata={"format": "pt", "waldo_backend": "huggingface-transformers", "waldo_architecture_sha256": begin["architecture_sha256"]})
-    os.replace(temporary, directory / "model.safetensors")
+    selection = None
+    if evaluation:
+        if not evaluations or evaluations[-1]["step"] != trainer.state.global_step:
+            raise ArtifactIntegrityError("the terminal step was not evaluated")
+        selected, checkpoint = select_candidate(evaluations, checkpoints)
+        # Reload the selected candidate, write the terminal artifact from it,
+        # then reload that file and require it to reproduce the selection.
+        published = construct(dtype)
+        load_model(published, str(directory / checkpoint["artifacts"][0]["path"].removeprefix(prefix + "/")), strict=True)
+        validate_model_finite(published)
+        save_weights(published, directory / "model.safetensors")
+        del published
+        candidate_loss = selected["metrics"]["heldout_loss"]
+        artifact_loss = reload_heldout_loss(directory / "model.safetensors")
+        check_agreement(artifact_loss, candidate_loss, "saved artifact", f"it does not reproduce selected step {selected['step']}")
+        selected["metrics"].update(artifact_heldout_loss=artifact_loss, artifact_heldout_perplexity=math.exp(min(artifact_loss, 80.0)),
+                                   serialization_loss_delta=artifact_loss - candidate_loss)
+        selection = dict(step=selected["step"], tokens=selected["tokens"], metric="heldout_loss", value=candidate_loss)
+        emit("event", event=dict(kind="log", step=selected["step"], tokens=selected["tokens"],
+                                 message=f"selected checkpoint step {selected['step']} and verified the model artifact at held-out loss {artifact_loss:.4f}"))
+    else:
+        save_weights(model, directory / "model.safetensors")
     write_json(directory / "config.json", config.to_dict())
     write_json(directory / "training_args.json", args.to_dict())
     tokenizer_files = ["tokenizer.json"]
@@ -533,12 +704,14 @@ def run():
                     per_device_train_batch_size=args.per_device_train_batch_size, gradient_accumulation_steps=args.gradient_accumulation_steps,
                     global_batch_size=args.per_device_train_batch_size * args.gradient_accumulation_steps,
                     parameter_dtype=dtype, compute_dtype=sorted(execution["compute_dtypes"]), fp16=args.fp16, bf16=args.bf16,
-                    gradient_checkpointing=bool(getattr(model, "is_gradient_checkpointing", False)))
+                    gradient_checkpointing=bool(getattr(model, "is_gradient_checkpointing", False)),
+                    finite_gradient_norm_checks=execution["gradient_norms"])
     write_json(directory / "runtime.json", dict(runtime_facts(device), package=spec["package"], hardware=device_facts, execution=executed, **parameter_evidence(model, config)))
     artifacts = [dict(path=f"{prefix}/{name}", sha256=digest(directory / name), bytes=(directory / name).stat().st_size)
                  for name in ["model.safetensors", "config.json", "training_args.json", "runtime.json"] + tokenizer_files]
     emit("complete", observation=dict(simulated=False, steps=trainer.state.global_step, consumed_tokens=sum(consumption.values()), final_loss=result.training_loss,
-                                     evaluations=evaluations, artifacts=artifacts, consumption=[dict(corpus=key, token_targets=value) for key, value in sorted(consumption.items())]))
+                                     checkpoints=checkpoints, evaluations=evaluations, selected_checkpoint=selection, artifacts=artifacts,
+                                     consumption=[dict(corpus=key, token_targets=value) for key, value in sorted(consumption.items())]))
 
 
 if __name__ == "__main__":
@@ -564,5 +737,7 @@ if __name__ == "__main__":
     except Exception as error:
         traceback.print_exc(file=sys.stderr)
         if sys.argv[1] not in ("--probe", "--resolve-trainer"):
-            emit("error", error=str(error))
+            # Integrity failures are terminal; WALDO must not retry into them.
+            error_class = "artifact-integrity" if isinstance(error, ArtifactIntegrityError) else "numerical-integrity" if isinstance(error, NumericalIntegrityError) else ""
+            emit("error", error=str(error), error_class=error_class)
         sys.exit(1)

@@ -192,7 +192,10 @@ compute-precision execution, eager compute-precision execution, eager FP32
 master weights, and the reloaded publishable artifact under the same FP32
 semantics used by chat inference. They fail immediately on material drift at
 any boundary. Training also stops before an optimizer update when loss or the
-optimizer-step gradient norm is non-finite. WALDO publishes the
+optimizer-step gradient norm is non-finite. The Transformers engine applies
+the same boundaries and gates, comparing its live compute-precision model, the
+same parameters without autocast, and each reloaded persisted candidate; see
+[MODEL-COMPOSE.md](MODEL-COMPOSE.md). WALDO publishes the
 persisted candidate with the lowest finite publishable `heldout_loss`, not
 necessarily the last optimizer step. It reloads the selected terminal artifact
 and evaluates that saved file again before completion. `RUN.json` records the

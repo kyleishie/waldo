@@ -265,11 +265,43 @@ verify that incompatible byte configurations fail before producing weights.
 
 `TestTransformersRejectsDivergentTraining` uses the pinned runtime with a
 deliberately divergent FP32 CPU learning rate and no held-out evaluation. It
-requires a non-finite-loss error and no published weights. The worker additionally
+requires a non-finite loss or optimizer-step gradient-norm error, the terminal
+`numerical-integrity` failure class, and no published weights. With the pinned
+5.16.1 runtime, the step-2 gradient norm is the first non-finite value, so the
+run fails before that optimizer update. The worker additionally
 checks final floating-point parameters and buffers before saving, since the last
 optimizer update may corrupt them after the last loss calculation. Unicode tests
 check bounded, lossless output frames through both the Python emitter and Go
 reader, plus stop-prefix and incomplete UTF-8 handling.
+
+`TestTransformersPublishesVerifiedBestCandidate` trains a tiny FP32 Llama on CPU
+for four steps with `evaluate_every: 1` and a high constant learning rate. With
+this seed the final step regresses: held-out loss is 2.97 at step 3 and 3.19 at
+step 4. The test requires the following:
+
+- Every step is a persisted, evaluated candidate with live, compute-precision,
+  and reloaded publishable losses.
+- The full budget completes.
+- The earlier best step is selected, and its reloaded artifact verification is
+  recorded.
+- The published tensors equal the selected candidate's tensors, not the final
+  step's.
+- `runtime.json` records one finite gradient-norm check per optimizer step.
+- A continuation stage initializes from the published weights' hash.
+
+`TestTransformersCompletionRequiresVerifiedBestCandidate` runs without a
+runtime. A mock Transformers backend reports a regressed final step, and the
+test requires completion to fail when any of these is true:
+
+- The final candidate is selected instead of the earlier best.
+- Selection or artifact verification is missing.
+- The selected candidate was not persisted.
+- Evaluations are absent.
+- The reloaded artifact loss drifts beyond tolerance.
+
+The worker unit tests cover earliest-tie selection, the 0.02-or-one-percent
+tolerance, non-finite gradient norms, boundary scheduling, and separating
+autocast from the live parameters.
 
 #### Transformers validation scope
 
@@ -280,7 +312,8 @@ Recorded September/October 2026 acceptance results:
 | Family lifecycle | CPU and GB10 CUDA FP32; six-family CUDA FP16/BF16 matrix | Llama/Qwen2/Qwen3 baseline tests stay FP32; not a production-scale benchmark |
 | Tokenizer lifecycle | Byte and pinned Qwen HF tokenizer: train, continue, stream, export/reload, corruption rejection | Custom Qwen3 FP32 fixtures, not every tokenizer/model/precision combination |
 | Resolved execution facts | Pinned Trainer resolution in the run BOM matches observed micro-batches, sequences, and compute dtype; CPU FP32 and GB10 CUDA FP32/FP16/BF16; FP16-on-CPU rejected before run creation | Tiny fixtures with accumulation 1 and 2; gradient checkpointing observed on CPU only |
-| Numerical safety | Deliberately divergent no-held-out run rejected; final NaN parameters/Inf buffers rejected | Does not prove convergence or gradient/update parity |
+| Numerical safety | Deliberately divergent no-held-out run rejected at a non-finite optimizer-step gradient norm as terminal `numerical-integrity`; final NaN parameters/Inf buffers rejected | Does not prove convergence or gradient/update parity |
+| Publication safety (ADR 0044/0079) | Step-1/periodic/terminal candidates persisted and reload-verified; regressed final step not published; continuation from published weights; CPU FP32 regression fixture; GB10 CUDA FP32 and BF16 lifecycle runs verify the artifact | Serialization- and precision-drift rejection exercised by unit and mocked-completion tests, not induced in a real run. With FP16, the first GradScaler overflow at the default initial scale is a non-finite unscaled gradient norm and fails closed, as in the native PyTorch worker. Gemma 2, OLMo 2, and Qwen3.5 fixtures fail at step 1 for this reason |
 | Stream and cleanup | Large valid Unicode output, bounded frames, stop prefixes, cancellation, crash/protocol failure and reaping | Large-output runtime probe used the pinned Qwen tokenizer |
 | Export evidence | Artifact hashes and training-run package provenance enter the signing callback | Not an external signing-service integration test |
 | ROCm | Device path implemented | No real ROCm hardware validation yet |

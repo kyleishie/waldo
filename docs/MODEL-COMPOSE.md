@@ -72,7 +72,7 @@ all Transformers models, tasks, Trainer options, or extension points.
 | --- | --- | --- |
 | Initialization | Random weights from explicit config; compatible managed `base.model` | No HF checkpoint import through `base.source` |
 | Objectives | Causal LM and WALDO assistant-response masking | No arbitrary task heads, HF chat-template training, or custom Trainer subclasses |
-| Training | Standard `Trainer`, listed argument allowlist, gradient accumulation, final evaluation and weights | No periodic evaluation/checkpoints, distributed training, or exact optimizer-state resume |
+| Training | Standard `Trainer`, listed argument allowlist, gradient accumulation, ADR 0044 safety evaluations, optional `evaluate_every`, ADR 0079 best-candidate publication with reloaded-artifact verification | No resumable checkpoints (`checkpoint_every`), distributed training, or exact optimizer-state resume |
 | Continuation | Verified completed-run weights and the same immutable architecture/tokenizer | New optimizer/scheduler state; not an exact continuation of optimizer history |
 | Tokenizers | Byte, tiktoken training, pinned data-only HF fast tokenizers | Chat and export support byte/HF only; no automatic acquisition or remote tokenizer code |
 | Devices | CPU or one visible CUDA/ROCm GPU; FP16/BF16 training subject to device checks | No Apple MPS or multi-GPU execution; ROCm has not been hardware-validated |
@@ -155,8 +155,11 @@ including assistant-response loss masks.
 facts. The native `parameters` fields `batch_size`, `learning_rate`,
 `gradient_accumulation_steps`, `compute_precision`, `activation_checkpointing`,
 `compile`, `optimizer`, `schedule`, `weight_decay`, `warmup_steps`,
-`warmdown_steps`, `minimum_learning_rate_ratio`, `checkpoint_every`, and
-`evaluate_every` are rejected even when they would agree. WALDO derives the
+`warmdown_steps`, `minimum_learning_rate_ratio`, and `checkpoint_every` are
+rejected even when they would agree. `evaluate_every` is a WALDO lifecycle
+cadence, not a Trainer argument, and remains a native stage parameter; for a
+Transformers stage it defaults to `0`, so only the step-1 and terminal safety
+evaluations run unless a periodic interval is set. WALDO derives the
 resolved native facts from the Trainer arguments, using these provider defaults
 when an argument is omitted:
 
@@ -193,18 +196,48 @@ TrainingArguments remain a hashed `training_args.json` artifact.
 WALDO owns output paths, stopping rules, data loaders, topology, and publication.
 Arguments such as `output_dir`, `max_steps`, `push_to_hub`, `report_to`, and
 distributed configuration are rejected rather than silently overriding the
-compose. The experimental worker runs on CPU or one visible GPU, performs a final
-held-out evaluation, and saves final weights. Periodic evaluation/checkpoint
-scheduling and optimizer-checkpoint resume are not implemented. An interrupted
-attempt without a checkpoint restarts that stage; completed stages can supply
-verified weights to subsequent stages.
+compose. The experimental worker runs on CPU or one visible GPU. Resumable
+checkpoint scheduling and optimizer-checkpoint resume are not implemented. An
+interrupted attempt restarts that stage; completed stages can supply verified
+weights to subsequent stages.
 
 The lifecycle contracts apply to this engine without exception. With held-out
-data, [ADR 0044](adr/0044-verify-persisted-training-artifacts.md) safety
-evaluations, [ADR 0079](adr/0079-publish-best-heldout-checkpoint.md)
-best-candidate publication, and reloaded-artifact verification are required.
-The current final-only evaluation is an implementation gap, not an accepted
-policy. Resume from verified checkpoint bundles under
+data, the worker implements
+[ADR 0044](adr/0044-verify-persisted-training-artifacts.md) and
+[ADR 0079](adr/0079-publish-best-heldout-checkpoint.md) as follows:
+
+- Every optimizer step fails closed, before the update, when the training loss
+  or the gradient norm Trainer computes ahead of `optimizer.step()` is
+  non-finite. This applies whether or not `max_grad_norm` clips. Mixtral's
+  router auxiliary loss must also be finite.
+- Step 1, every `evaluate_every` boundary, and the terminal step are
+  evaluation boundaries. Each evaluates the live model under the Trainer's
+  compute precision (`live_eager_compute_heldout_loss`) and, for `fp16`/`bf16`,
+  the same live parameters without autocast (`live_eager_heldout_loss`). It
+  then persists the candidate as `artifacts/checkpoints/step-NNNNNNNN/model.safetensors`,
+  reloads it into a new model exactly as chat does (config dtype on CUDA, FP32
+  on CPU, eager, no autocast), and records that result as
+  `publishable_checkpoint_heldout_loss` and `heldout_loss`. Compute-precision
+  or serialization/dtype drift beyond the greater of 0.02 loss or one percent
+  fails the run. `torch.compile` is not supported, so no compiled comparison
+  exists.
+- After the full requested budget, WALDO publishes the persisted candidate with
+  the lowest finite `heldout_loss`; ties select the earliest step. This is
+  not early stopping. The worker reloads that candidate, writes
+  `artifacts/model.safetensors` from it, reloads the written file, and requires
+  `artifact_heldout_loss` to match the selection within the same tolerance.
+- Completion requires the selected checkpoint to be the best persisted
+  evaluated candidate and to carry verified artifact metrics; otherwise the run
+  fails. Numerical- and artifact-integrity failures are terminal.
+- Candidate checkpoints are publication evidence only. They hold weights, not
+  optimizer, scheduler, or RNG state, and are not reported as resume points.
+  Evaluations are therefore delivered with the completion observation rather
+  than as durable mid-run evaluation events.
+
+Continuation from a completed Transformers stage loads its published, verified
+`model.safetensors`: the selected candidate, which need not be the last
+optimizer step. Without held-out data, the final weights are published and no
+selection is recorded. Resume from verified checkpoint bundles under
 [ADR 0029](adr/0029-resumable-training-checkpoints.md) is planned and must not
 be relied on until implemented.
 
@@ -870,7 +903,7 @@ must use one representation or the other, never both.
 | `warmdown_steps` | no | half of the run for `warmup-stable-warmdown`, otherwise `0` | Linear warmdown duration. Warmup plus warmdown cannot exceed the run. |
 | `minimum_learning_rate_ratio` | no | `0.1` for cosine, `0` for warmup-stable-warmdown; `0..1` | Final learning rate as a fraction of the peak. |
 | `checkpoint_every` | no | `min(500, steps)`; `0..steps` | Checkpoint interval. Explicit zero disables periodic checkpoints. |
-| `evaluate_every` | no | `min(500, steps)`; `0..steps` | Held-out evaluation interval. Explicit zero disables periodic evaluation; real backends still run safety and terminal artifact-quality evaluations whenever a held-out set exists. |
+| `evaluate_every` | no | `min(500, steps)`; Transformers `0`; `0..steps` | Held-out evaluation interval. Explicit zero disables periodic evaluation; real backends still run safety and terminal artifact-quality evaluations whenever a held-out set exists. |
 | `shuffle_buffer_records` | no | default `1024`; `1..1000000` | Maximum records retained by deterministic bounded shuffle. |
 | `shuffle_buffer_bytes` | no | default 64 MiB; `1 B..16 GiB` | Maximum record text retained by deterministic bounded shuffle. |
 | `corpus_weights` | only for `causal-pretrain-weighted`; legacy form | each weight `1..1000000` | Integer relative token exposure keyed by every selected corpus path. Configured corpus `weight` fields are preferred. |

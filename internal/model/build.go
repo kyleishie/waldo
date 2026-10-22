@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -901,7 +902,11 @@ func (builder Builder) executeTrainingAttempt(ctx context.Context, name, modelPa
 							if evaluation.Step != observation.SelectedCheckpoint.Step {
 								continue
 							}
-							_, verified = evaluation.Metrics["artifact_heldout_loss"]
+							var artifactLoss float64
+							if artifactLoss, verified = evaluation.Metrics["artifact_heldout_loss"]; verified {
+								// ADR 0044: the reloaded artifact must reproduce the selection.
+								verified = math.Abs(artifactLoss-observation.SelectedCheckpoint.Value) <= max(0.02, math.Abs(observation.SelectedCheckpoint.Value)*0.01)
+							}
 							break
 						}
 						if !verified {

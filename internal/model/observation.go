@@ -19,7 +19,7 @@ import (
 )
 
 func backendRequiresArtifactVerification(name string) bool {
-	return name == training.BackendPyTorch || name == training.BackendTorchTitan || name == training.BackendMLX
+	return name == training.BackendPyTorch || name == training.BackendTorchTitan || name == training.BackendMLX || name == training.BackendTransformers
 }
 
 func validateBackendObservation(runDirectory string, planned PlannedStage, observation training.Observation) error {
