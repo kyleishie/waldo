@@ -217,7 +217,17 @@ tokenizers are downloaded. Test-managed models and exported releases are local
 temporary files. Attach command output and GPU/runtime details to PR feedback.
 The new-family matrix honors the selected mixed precision; existing Llama and
 Qwen smoke tests also run as baseline FP32 regressions.
+For both the initial run (accumulation 1) and the continuation (per-device
+batch 1, accumulation 2), the family test requires the run BOM's resolved
+global batch, accumulation, compute precision, and pinned Trainer resolution
+to equal the worker's observed `runtime.json` execution evidence: optimizer
+steps, micro-batches, sequences, and output-head compute dtype.
 CPU and mocked hardware-policy tests do not establish GPU correctness.
+
+`TestTransformersRealTrainerResolution` uses the same runtime variables on CPU.
+It requires `fp16` on CPU to fail during pinned Trainer resolution without
+creating run state, and requires gradient checkpointing with accumulation 2 to
+be recorded in the run BOM and observed in execution evidence.
 
 For the byte-versus-HF tokenizer lifecycle audit, additionally set
 `WALDO_HF_TOKENIZER_DIR` to the pinned Qwen3 tokenizer files used by
@@ -269,6 +279,7 @@ Recorded September/October 2026 acceptance results:
 | --- | --- | --- |
 | Family lifecycle | CPU and GB10 CUDA FP32; six-family CUDA FP16/BF16 matrix | Llama/Qwen2/Qwen3 baseline tests stay FP32; not a production-scale benchmark |
 | Tokenizer lifecycle | Byte and pinned Qwen HF tokenizer: train, continue, stream, export/reload, corruption rejection | Custom Qwen3 FP32 fixtures, not every tokenizer/model/precision combination |
+| Resolved execution facts | Pinned Trainer resolution in the run BOM matches observed micro-batches, sequences, and compute dtype; CPU FP32 and GB10 CUDA FP32/FP16/BF16; FP16-on-CPU rejected before run creation | Tiny fixtures with accumulation 1 and 2; gradient checkpointing observed on CPU only |
 | Numerical safety | Deliberately divergent no-held-out run rejected; final NaN parameters/Inf buffers rejected | Does not prove convergence or gradient/update parity |
 | Stream and cleanup | Large valid Unicode output, bounded frames, stop prefixes, cancellation, crash/protocol failure and reaping | Large-output runtime probe used the pinned Qwen tokenizer |
 | Export evidence | Artifact hashes and training-run package provenance enter the signing callback | Not an external signing-service integration test |

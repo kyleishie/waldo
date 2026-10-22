@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math"
 
 	"github.com/openwaldo/waldo/internal/training"
 	"gopkg.in/yaml.v3"
@@ -69,35 +68,44 @@ func normalizeTransformersCompose(data []byte) ([]byte, error) {
 		if err := item.Trainer.Validate(); err != nil {
 			return nil, err
 		}
-		if stage.Parameters.BatchSize != 0 || stage.Parameters.LearningRate != 0 || stage.Parameters.WeightDecay != nil || stage.Parameters.WarmupSteps != nil || stage.Parameters.CheckpointEvery != nil || stage.Parameters.EvaluateEvery != nil {
-			return nil, fmt.Errorf("Transformers optimizer/batch arguments belong in stage.trainer.arguments; checkpoint/evaluation scheduling is not supported yet")
+		// Trainer arguments are the only authority for these facts. Native
+		// duplicates are ambiguous even when equal, so a compose cannot set them.
+		native := stage.Parameters
+		if native.BatchSize != 0 || native.LearningRate != 0 || native.GradientAccumulation != 0 || native.ComputePrecision != "" || native.ActivationCheckpointing || native.Compile ||
+			native.Optimizer != "" || native.Schedule != "" || native.WeightDecay != nil || native.WarmupSteps != nil || native.WarmdownSteps != nil || native.MinimumRateRatio != nil {
+			return nil, fmt.Errorf("stage %s: Transformers batch, accumulation, learning-rate, precision, recomputation, optimizer, and schedule settings belong in stage.trainer.arguments; compile is unsupported", stage.Name)
 		}
-		arguments, err := json.Marshal(item.Trainer.Arguments)
+		if native.CheckpointEvery != nil || native.EvaluateEvery != nil {
+			return nil, fmt.Errorf("stage %s: Transformers checkpoint/evaluation scheduling is not supported yet", stage.Name)
+		}
+		execution, err := item.Trainer.Execution()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("stage %s: %w", stage.Name, err)
 		}
-		var projected struct {
-			Batch        int64   `json:"per_device_train_batch_size"`
-			Accumulation int64   `json:"gradient_accumulation_steps"`
-			Rate         float64 `json:"learning_rate"`
+		if err := training.ValidateTransformersPrecision(execution.ComputePrecision, architecture.ParameterDType); err != nil {
+			return nil, fmt.Errorf("stage %s: %w", stage.Name, err)
 		}
-		if err := json.Unmarshal(arguments, &projected); err != nil {
-			return nil, err
-		}
-		if _, exists := item.Trainer.Arguments["gradient_accumulation_steps"]; !exists {
-			projected.Accumulation = 1
-		}
-		if projected.Batch <= 0 || projected.Accumulation <= 0 || projected.Batch > math.MaxInt64/projected.Accumulation || projected.Rate <= 0 {
-			return nil, fmt.Errorf("trainer requires positive per_device_train_batch_size, gradient_accumulation_steps, and learning_rate")
-		}
-		stage.Parameters.BatchSize = projected.Batch * projected.Accumulation
-		stage.Parameters.LearningRate = projected.Rate
 		zero := int64(0)
 		stage.Parameters.CheckpointEvery, stage.Parameters.EvaluateEvery = &zero, &zero
 		stage.Parameters.Trainer = &item.Trainer
 		compose.Stages = append(compose.Stages, stage)
 	}
 	return json.Marshal(compose)
+}
+
+func validateTrainerStage(trainer *training.TransformersTrainer, architecture Architecture) error {
+	if trainer == nil {
+		return nil
+	}
+	if err := trainer.Validate(); err != nil {
+		return err
+	}
+	execution, err := trainer.Execution()
+	if err != nil || architecture.ParameterDType == "" {
+		// Stage preparation validates before the architecture is known.
+		return err
+	}
+	return training.ValidateTransformersPrecision(execution.ComputePrecision, architecture.ParameterDType)
 }
 
 func (architecture Architecture) validateTokenizer() error {

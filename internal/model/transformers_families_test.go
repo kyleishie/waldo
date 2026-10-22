@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,9 @@ func TestTransformersFamilyLifecycle(t *testing.T) {
 			if inspection.RunBOMs[1].Initialization == nil || inspection.Runs[1].Observation.ConsumedTokens != 128 {
 				t.Fatal("continuation/accounting failed")
 			}
+			for index, wantAccumulation := range []int64{1, 2} {
+				assertHFExecutionAgrees(t, inspection, index, wantAccumulation)
+			}
 			if os.Getenv("WALDO_TRANSFORMERS_DEVICE") == "cuda" && len(inspection.RunBOMs[1].Execution.Accelerators) != 1 {
 				t.Fatal("GPU test ran without accelerator evidence")
 			}
@@ -108,6 +112,59 @@ func TestTransformersFamilyLifecycle(t *testing.T) {
 			t.Logf("%s: %v parameters, device %v, continuation + chat + export passed", family, evidence["parameters"], evidence["device"])
 		})
 	}
+}
+
+// assertHFExecutionAgrees compares the immutable run BOM with the worker's
+// observed execution evidence: batch, accumulation, and compute precision.
+func assertHFExecutionAgrees(t *testing.T, inspection model.Inspection, index int, wantAccumulation int64) {
+	t.Helper()
+	bom, run := inspection.RunBOMs[index], inspection.Model.Runs[index]
+	parameters := bom.Parameters
+	if parameters.TrainerResolution == nil || parameters.GradientAccumulation != wantAccumulation || parameters.BatchSize != 2 {
+		t.Fatalf("run %d resolved facts %+v", index, parameters)
+	}
+	precision := map[string]string{"": "auto", "fp16": "float16", "bf16": "bfloat16"}[os.Getenv("WALDO_HF_TEST_PRECISION")]
+	if parameters.ComputePrecision != precision {
+		t.Fatalf("run %d compute_precision %q, want %q", index, parameters.ComputePrecision, precision)
+	}
+	resolved := parameters.TrainerResolution.Arguments
+	if resolved["fp16"] != (precision == "float16") || resolved["bf16"] != (precision == "bfloat16") || resolved["gradient_accumulation_steps"].(float64) != float64(wantAccumulation) {
+		t.Fatalf("run %d pinned Trainer resolution %+v", index, resolved)
+	}
+	var runtimePath string
+	for _, artifact := range inspection.Runs[index].Observation.Artifacts {
+		if strings.HasSuffix(artifact.Path, "/runtime.json") {
+			runtimePath = filepath.Join(inspection.Path, "runs", fmt.Sprintf("%04d-%s-%s", run.Ordinal, run.Stage, run.ID), artifact.Path)
+		}
+	}
+	data, err := os.ReadFile(runtimePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence struct {
+		Execution struct {
+			OptimizerSteps       int64    `json:"optimizer_steps"`
+			MicroBatches         int64    `json:"micro_batches"`
+			Sequences            int64    `json:"sequences"`
+			GradientAccumulation int64    `json:"gradient_accumulation_steps"`
+			GlobalBatchSize      int64    `json:"global_batch_size"`
+			ParameterDType       string   `json:"parameter_dtype"`
+			ComputeDType         []string `json:"compute_dtype"`
+		} `json:"execution"`
+	}
+	if err := json.Unmarshal(data, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	executed := evidence.Execution
+	wantDType := precision
+	if precision == "auto" {
+		wantDType = executed.ParameterDType
+	}
+	if executed.OptimizerSteps != parameters.Steps || executed.MicroBatches != parameters.Steps*wantAccumulation || executed.Sequences != parameters.Steps*parameters.BatchSize ||
+		executed.GradientAccumulation != wantAccumulation || executed.GlobalBatchSize != parameters.BatchSize || len(executed.ComputeDType) != 1 || executed.ComputeDType[0] != wantDType {
+		t.Fatalf("run %d executed %+v, resolved %+v", index, executed, parameters)
+	}
+	t.Logf("run %d: global batch %d = %d micro-batches/step, compute %s, resolved %s", index, executed.GlobalBatchSize, executed.MicroBatches/executed.OptimizerSteps, executed.ComputeDType[0], parameters.ComputePrecision)
 }
 
 func hfPrepared(t *testing.T, stage model.Stage) model.PreparedStage {

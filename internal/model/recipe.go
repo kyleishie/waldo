@@ -617,10 +617,8 @@ func (compose Compose) Validate() error {
 		if (compose.Architecture.Transformers != nil) != (stage.Parameters.Trainer != nil) {
 			return fmt.Errorf("stage %s trainer must match the architecture provider", stage.Name)
 		}
-		if stage.Parameters.Trainer != nil {
-			if err := stage.Parameters.Trainer.Validate(); err != nil {
-				return err
-			}
+		if err := validateTrainerStage(stage.Parameters.Trainer, compose.Architecture); err != nil {
+			return fmt.Errorf("stage %s: %w", stage.Name, err)
 		}
 		if !validName.MatchString(stage.Name) || seen[stage.Name] {
 			return fmt.Errorf("stage %d has invalid or duplicate name %q", i+1, stage.Name)

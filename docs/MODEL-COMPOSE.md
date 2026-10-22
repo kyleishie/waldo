@@ -135,11 +135,8 @@ Each stage declares `trainer.class: Trainer` and `trainer.arguments`.
 Trainer name, the product of the two is the portable global optimizer batch in
 the [ADR 0071](adr/0071-global-batch-gradient-accumulation.md) sense: the number
 of packed sequences in each optimizer step. It does not scale with the number of
-devices on a host. The resolved global batch, accumulation, and precision belong
-in the run's immutable execution facts; resolving them before run creation,
-rather than only reporting Trainer's resolved arguments afterward, is planned.
-A future multi-process adapter must keep that global batch fixed. The allowed
-passthroughs are:
+devices on a host. A future multi-process adapter must keep that global batch
+fixed. The allowed passthroughs are:
 
 - `per_device_train_batch_size`, `per_device_eval_batch_size`,
   `gradient_accumulation_steps`, `learning_rate`, `weight_decay`;
@@ -152,9 +149,46 @@ The installed TrainingArguments implementation validates values. `parameters`
 continues to own the token/step/epoch budget, sequence length, seed, corpus
 selection, weighted ordering, bounded shuffle, and deterministic held-out
 selection. WALDO supplies already-tokenized, packed, shifted labels to Trainer,
-including assistant-response loss masks. Native optimizer/scheduler defaults
-are not recorded as claims about a Transformers run. Requested Trainer arguments
-are in the run BOM; resolved TrainingArguments are a hashed output artifact.
+including assistant-response loss masks.
+
+`trainer.arguments` is the only authority for a Transformers stage's execution
+facts. The native `parameters` fields `batch_size`, `learning_rate`,
+`gradient_accumulation_steps`, `compute_precision`, `activation_checkpointing`,
+`compile`, `optimizer`, `schedule`, `weight_decay`, `warmup_steps`,
+`warmdown_steps`, `minimum_learning_rate_ratio`, `checkpoint_every`, and
+`evaluate_every` are rejected even when they would agree. WALDO derives the
+resolved native facts from the Trainer arguments, using these provider defaults
+when an argument is omitted:
+
+| Resolved fact | Derived from | Default when omitted |
+| --- | --- | --- |
+| `batch_size` (global) | `per_device_train_batch_size` × `gradient_accumulation_steps` | required |
+| `gradient_accumulation_steps` | `gradient_accumulation_steps` | 1 |
+| `learning_rate` | `learning_rate` | required |
+| `compute_precision` | `fp16: true` → `float16`; `bf16: true` → `bfloat16` | `auto`: the config `dtype` |
+| `activation_checkpointing` | `gradient_checkpointing` | false |
+| Forecast warmup | `warmup_steps`: a value of at least 1 is a step count; a smaller value is a fraction of optimizer steps, rounded up | 0 |
+
+`fp16` and `bf16` are mutually exclusive. `fp16` requires `dtype: float32`, and
+`bf16` requires `float32` or `bfloat16`. Forecasts and fitness reports use the
+derived global batch, micro-batch, recomputation, and warmup. Native
+optimizer/scheduler defaults are not recorded as claims about a Transformers
+run; Trainer's optimizer, scheduler, and their defaults stay provider facts.
+
+Before a run ID exists, the selected host's verified pinned package constructs
+the exact TrainingArguments the worker will use and reports the effective value
+of every allowlisted argument, defaults included, plus its resolved warmup
+steps. WALDO rejects the stage if any requested argument resolves to a
+different value, if the resolution disagrees with the derived batch,
+accumulation, learning rate, precision, or recomputation, or if the host cannot
+execute it, for example `fp16` on CPU. The run BOM records the requested
+arguments as `parameters.trainer` and this resolution as
+`parameters.trainer_resolution`. The worker rebuilds TrainingArguments, fails
+unless they reproduce the recorded resolution exactly, and fails unless the
+executed micro-batches, sequences, output-head compute dtype, and gradient
+checkpointing match the resolved plan. The `execution` object in the hashed
+`runtime.json` artifact records those observed values, and the full resolved
+TrainingArguments remain a hashed `training_args.json` artifact.
 
 WALDO owns output paths, stopping rules, data loaders, topology, and publication.
 Arguments such as `output_dir`, `max_steps`, `push_to_hub`, `report_to`, and
@@ -186,8 +220,8 @@ MPS is not implemented; auto uses CPU on macOS.
 
 Trainer `fp16` and `bf16` options are mutually exclusive and GPU-only here.
 `fp16` scaling requires float32 model parameters. BF16 requires device support.
-Device and precision are checked again in the worker, and Trainer's actual
-device/topology must match resolution. Run evidence includes the selected
+These device checks run during Trainer resolution, before run creation, and
+again in the worker, and Trainer's actual device/topology must match resolution. Run evidence includes the selected
 hardware and resolved Trainer arguments. GPU execution requires operator-run
 hardware tests before claiming validation on that hardware; CPU tests are not
 evidence of GPU correctness.

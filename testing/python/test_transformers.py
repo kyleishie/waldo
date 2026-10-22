@@ -238,5 +238,66 @@ class PackageVerificationTests(unittest.TestCase):
             worker.verify_package(self.wheel, self.pin)
 
 
+class TrainerPlanTests(unittest.TestCase):
+    def arguments(self, **overrides):
+        values = dict(device=types.SimpleNamespace(type="cuda"), world_size=1, n_gpu=1, per_device_train_batch_size=1,
+                      gradient_accumulation_steps=2, learning_rate=0.001, fp16=False, bf16=True, gradient_checkpointing=True)
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def parameters(self, **overrides):
+        values = dict(steps=4, batch_size=2, gradient_accumulation_steps=2, learning_rate=0.001, compute_precision="bfloat16", activation_checkpointing=True)
+        values.update(overrides)
+        return values
+
+    def test_resolved_plan_matches_trainer(self):
+        worker.check_trainer_plan(self.arguments(), self.parameters(), "cuda")
+        worker.check_trainer_plan(self.arguments(per_device_train_batch_size=2, gradient_accumulation_steps=1, bf16=False, gradient_checkpointing=False),
+                                  dict(steps=4, batch_size=2, learning_rate=0.001), "cuda")
+
+    def test_divergent_plan_fails_closed(self):
+        for arguments, parameters in [
+                (self.arguments(per_device_train_batch_size=2, gradient_accumulation_steps=1), self.parameters()),
+                (self.arguments(), self.parameters(gradient_accumulation_steps=1, batch_size=2)),
+                (self.arguments(learning_rate=0.002), self.parameters()),
+                (self.arguments(bf16=False), self.parameters()),
+                (self.arguments(bf16=False, fp16=True), self.parameters()),
+                (self.arguments(), self.parameters(compute_precision="auto")),
+                (self.arguments(gradient_checkpointing=False), self.parameters()),
+                (self.arguments(world_size=2), self.parameters()),
+                (self.arguments(device=types.SimpleNamespace(type="cpu")), self.parameters())]:
+            with self.subTest(arguments=arguments, parameters=parameters), self.assertRaises(ValueError):
+                worker.check_trainer_plan(arguments, parameters, "cuda")
+
+    def test_compute_dtype_follows_parameters_or_autocast(self):
+        self.assertEqual(worker.compute_dtype(dict(compute_precision="auto"), "float32"), "float32")
+        self.assertEqual(worker.compute_dtype(dict(), "bfloat16"), "bfloat16")
+        self.assertEqual(worker.compute_dtype(dict(compute_precision="float16"), "float32"), "float16")
+        self.assertEqual(worker.compute_dtype(dict(compute_precision="bfloat16"), "float32"), "bfloat16")
+        with self.assertRaises(ValueError):
+            worker.compute_dtype(dict(compute_precision="float64"), "float32")
+
+    def test_resolution_reports_effective_allowlist(self):
+        arguments = types.SimpleNamespace(to_dict=lambda: dict(learning_rate=0.001, optim="adamw_torch_fused", output_dir="/run"),
+                                          get_warmup_steps=lambda steps: math.ceil(steps * 0.5))
+        resolution = worker.trainer_resolution(arguments, dict(steps=3), ["learning_rate", "optim"])
+        self.assertEqual(resolution, dict(arguments=dict(learning_rate=0.001, optim="adamw_torch_fused"), warmup_steps=2))
+
+    def test_strict_value_comparison(self):
+        self.assertTrue(worker.same_value(dict(a=[1, 2.0], b=None), dict(a=[1.0, 2], b=None)))
+        for left, right in [(True, 1), (0, False), ("1", 1), (dict(a=1), dict(a=1, b=2)), ([1], [1, 1]), (None, 0)]:
+            with self.subTest(left=left, right=right):
+                self.assertFalse(worker.same_value(left, right))
+
+    def test_bf16_requires_compatible_parameters(self):
+        torch = types.SimpleNamespace(tensor=lambda *args, **kwargs: types.SimpleNamespace(sum=lambda: types.SimpleNamespace(item=lambda: 1)),
+                                      cuda=types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 1, is_bf16_supported=lambda: True,
+                                                                 get_device_properties=lambda _: types.SimpleNamespace(name="GPU", total_memory=1024)))
+        facts = dict(device="cuda", accelerator="GPU", memory_bytes=1024)
+        self.assertEqual(worker.validate_device(torch, facts, dict(bf16=True), "bfloat16"), "cuda")
+        with self.assertRaises(ValueError):
+            worker.validate_device(torch, facts, dict(bf16=True), "float16")
+
+
 if __name__ == "__main__":
     unittest.main()

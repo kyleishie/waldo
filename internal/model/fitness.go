@@ -185,10 +185,18 @@ func analyzeFitness(plan Plan, plannedTokens int64, conventionalFLOPs float64) (
 		if err != nil {
 			return FitnessAnalysis{}, fmt.Errorf("stage %s fitness parameters: %w", stage.Name, err)
 		}
+		warmup := resolved.Schedule.WarmupSteps
+		if resolved.Trainer != nil {
+			execution, err := resolved.Trainer.Execution()
+			if err != nil {
+				return FitnessAnalysis{}, fmt.Errorf("stage %s fitness trainer: %w", stage.Name, err)
+			}
+			warmup = execution.WarmupSteps(resolved.Steps)
+		}
 		stageFitness := StageFitness{
 			Name: stage.Name, RequestedTokens: resolved.RequestedTokens, PlannedTokens: stage.PlannedTokens,
 			GlobalTokensPerOptimizerStep: resolved.BatchSize * resolved.SequenceLength, OptimizerSteps: resolved.Steps,
-			WarmupPercent:           percent(uint64(resolved.Schedule.WarmupSteps), uint64(resolved.Steps)),
+			WarmupPercent:           percent(uint64(warmup), uint64(resolved.Steps)),
 			WarmdownPercent:         percent(uint64(resolved.Schedule.WarmdownSteps), uint64(resolved.Steps)),
 			CorpusMeasurementStatus: "requires-corpus-preflight",
 			CorpusMeasurementReason: "unique tokenizer tokens, corpus passes, records, EOS boundaries, and record-length distributions are not present in a portable compose",
@@ -211,7 +219,7 @@ func analyzeFitness(plan Plan, plannedTokens int64, conventionalFLOPs float64) (
 				RankLocalMicroBatchSequences: globalMicro / world, PreservesGlobalBatch: true, PreservesSampleOrder: true,
 			})
 		}
-		if resolved.Schedule.WarmupSteps*5 > resolved.Steps {
+		if warmup*5 > resolved.Steps {
 			warnings = append(warnings, FitnessWarning{Code: "warmup-large-fraction", Severity: "warning", Message: fmt.Sprintf("stage %s warmup consumes %.1f%% of optimizer steps", stage.Name, stageFitness.WarmupPercent), Threshold: "warn above 20%"})
 		}
 		if resolved.BatchSize*resolved.SequenceLength*10 > resolved.PlannedTokenCapacity {

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"github.com/openwaldo/waldo/internal/training"
 )
 
 const (
@@ -248,11 +250,15 @@ func maximumActivationWorkspace(plan Plan, GPUs int) (uint64, error) {
 	}
 	var maxActivations uint64
 	for _, stage := range plan.Stages {
-		accumulation := max(int64(1), stage.Parameters.GradientAccumulation)
-		globalMicroBatch := divideRoundUp(uint64(stage.Parameters.BatchSize), uint64(accumulation))
+		parameters, err := training.ProjectTrainerParameters(stage.Parameters)
+		if err != nil {
+			return 0, fmt.Errorf("stage %s: %w", stage.Name, err)
+		}
+		accumulation := max(int64(1), parameters.GradientAccumulation)
+		globalMicroBatch := divideRoundUp(uint64(parameters.BatchSize), uint64(accumulation))
 		batch := divideRoundUp(globalMicroBatch, uint64(GPUs))
 		activationFactor := uint64(72)
-		if stage.Parameters.ActivationCheckpointing {
+		if parameters.ActivationCheckpointing {
 			// Layer checkpointing retains inputs instead of every intermediate.
 			// Keep this deliberately conservative until calibrated GPU evidence
 			// supports a tighter backend-specific estimate.

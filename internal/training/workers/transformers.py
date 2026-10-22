@@ -18,7 +18,7 @@ import tempfile
 import traceback
 import zipfile
 
-REVISION = "builtin-transformers-worker-schema-1-r5"
+REVISION = "builtin-transformers-worker-schema-1-r6"
 PROTOCOL_OUTPUT = sys.stdout
 
 
@@ -193,8 +193,80 @@ def validate_device(torch, facts, arguments=None, dtype="float32"):
         raise ValueError("this GPU does not support bfloat16")
     if arguments.get("fp16") and dtype != "float32":
         raise ValueError("fp16 Trainer scaling requires float32 model parameters")
+    if arguments.get("bf16") and dtype not in ("float32", "bfloat16"):
+        raise ValueError("bf16 Trainer autocast requires float32 or bfloat16 model parameters")
     torch.tensor([1.0], device=device).sum().item()
     return device
+
+
+def training_arguments(transformers, parameters, device, output_dir):
+    """Construct the only TrainingArguments WALDO executes: compose passthroughs
+    plus WALDO-owned paths, budget, seed, data loading, and publication."""
+    arguments = dict(parameters["trainer"]["arguments"])
+    arguments.update(output_dir=str(output_dir), max_steps=parameters["steps"], seed=parameters["seed"], data_seed=parameters["seed"],
+                     use_cpu=device == "cpu", report_to="none", push_to_hub=False, save_strategy="no", eval_strategy="no", disable_tqdm=True,
+                     dataloader_num_workers=0, dataloader_pin_memory=False, remove_unused_columns=False, prediction_loss_only=True)
+    return transformers.TrainingArguments(**arguments)
+
+
+def compute_dtype(parameters, dtype):
+    """The floating-point type of forward computation implied by the resolved plan."""
+    precision = parameters.get("compute_precision", "auto")
+    if precision not in ("auto", "float16", "bfloat16"):
+        raise ValueError("unsupported Transformers compute_precision")
+    return dtype if precision == "auto" else precision
+
+
+def check_trainer_plan(args, parameters, device):
+    """Fail unless Trainer will execute WALDO's resolved batch, precision, and recomputation."""
+    if args.device.type != device or args.world_size != 1 or (device == "cuda" and args.n_gpu != 1):
+        raise ValueError("Trainer device/topology differs from WALDO runtime resolution")
+    accumulation = parameters.get("gradient_accumulation_steps", 1)
+    if args.gradient_accumulation_steps != accumulation or args.per_device_train_batch_size * accumulation != parameters["batch_size"]:
+        raise ValueError("Trainer batch or gradient accumulation differs from WALDO's resolved plan")
+    if args.learning_rate != parameters["learning_rate"]:
+        raise ValueError("Trainer learning rate differs from WALDO's resolved plan")
+    precision = "float16" if args.fp16 else "bfloat16" if args.bf16 else "auto"
+    if precision != parameters.get("compute_precision", "auto"):
+        raise ValueError("Trainer mixed precision differs from WALDO's resolved compute_precision")
+    if bool(args.gradient_checkpointing) != bool(parameters.get("activation_checkpointing", False)):
+        raise ValueError("Trainer gradient checkpointing differs from WALDO's resolved activation_checkpointing")
+
+
+def trainer_resolution(args, parameters, names):
+    values = args.to_dict()
+    resolution = dict(arguments={name: values[name] for name in names}, warmup_steps=args.get_warmup_steps(parameters["steps"]))
+    # Round-trip through strict JSON so the recorded and executed forms match.
+    return json.loads(json.dumps(resolution, allow_nan=False))
+
+
+def same_value(left, right):
+    """JSON equality that does not let bool and number values stand in for each other."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(same_value(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(same_value(a, b) for a, b in zip(left, right))
+    return type(left) is type(right) and left == right
+
+
+def resolve_trainer():
+    """Report the pinned package's effective Trainer settings before a run exists."""
+    request = json.loads(sys.argv[3])
+    device_facts = json.loads(sys.argv[4])
+    spec = request["architecture"]["transformers"]
+    parameters = request["parameters"]
+    transformers = verify_package(sys.argv[2], spec["package"])
+    import torch
+    dtype = spec["config"].get("dtype", "float32")
+    device = validate_device(torch, device_facts, parameters["trainer"]["arguments"], dtype)
+    with tempfile.TemporaryDirectory(prefix="waldo-trainer-") as temporary:
+        args = training_arguments(transformers, parameters, device, Path(temporary) / "trainer")
+        check_trainer_plan(args, parameters, device)
+        return trainer_resolution(args, parameters, request["arguments"])
 
 
 def parameter_evidence(model, config):
@@ -359,6 +431,14 @@ def run():
 
     consumption = {}
     evaluation_totals = [0.0, 0]
+    expected_dtype = getattr(torch, compute_dtype(parameters, dtype))
+    execution = dict(micro_batches=0, sequences=0, compute_dtypes=set(), head_dtype=None)
+
+    # Accelerate converts autocast outputs back to float32, so observe the
+    # output head's own result to see the precision that actually executed.
+    def observe_head(module, inputs, output):
+        execution["head_dtype"] = output.dtype
+    model.get_output_embeddings().register_forward_hook(observe_head)
     class WaldoTrainer(transformers.Trainer):
         def _get_num_items_in_batch(self, batch_samples, device):
             # Our labels are already shifted, unlike standard causal-LM labels.
@@ -386,6 +466,13 @@ def run():
             if not torch.isfinite(loss).all().item():
                 raise ValueError("non-finite model loss")
             if model.training:
+                # Observe what executed, not only what was requested.
+                observed, execution["head_dtype"] = execution["head_dtype"], None
+                if observed != expected_dtype:
+                    raise ValueError(f"Trainer computed {observed}, not the resolved {expected_dtype}")
+                execution["micro_batches"] += 1
+                execution["sequences"] += labels.shape[0]
+                execution["compute_dtypes"].add(str(observed).removeprefix("torch."))
                 for item in counts:
                     for corpus, count in item.items():
                         consumption[corpus] = consumption.get(corpus, 0) + count
@@ -398,17 +485,13 @@ def run():
         def on_step_end(self, args, state, control, **kwargs):
             emit("event", event=dict(kind="progress", step=state.global_step, tokens=sum(consumption.values()), message=f"Transformers step {state.global_step}/{parameters['steps']}"))
 
-    arguments = dict(trainer_spec["arguments"])
-    arguments.update(output_dir=str(directory / "trainer"), max_steps=parameters["steps"], seed=parameters["seed"], data_seed=parameters["seed"],
-                     use_cpu=device == "cpu", report_to="none", push_to_hub=False, save_strategy="no", eval_strategy="no", disable_tqdm=True,
-                     dataloader_num_workers=0, dataloader_pin_memory=False, remove_unused_columns=False, prediction_loss_only=True)
-    args = transformers.TrainingArguments(**arguments)
-    if args.device.type != device or args.world_size != 1 or (device == "cuda" and args.n_gpu != 1):
-        raise ValueError("Trainer device/topology differs from WALDO runtime resolution")
-    if args.per_device_train_batch_size * args.gradient_accumulation_steps != parameters["batch_size"]:
-        raise ValueError("Trainer effective batch differs from WALDO's resolved plan")
-    if args.learning_rate != parameters["learning_rate"]:
-        raise ValueError("Trainer learning rate differs from WALDO's resolved plan")
+    args = training_arguments(transformers, parameters, device, directory / "trainer")
+    check_trainer_plan(args, parameters, device)
+    pinned = parameters.get("trainer_resolution")
+    if pinned is None:
+        raise ValueError("run BOM is missing the pinned Trainer resolution")
+    if not same_value(trainer_resolution(args, parameters, sorted(pinned["arguments"])), pinned):
+        raise ValueError("Trainer arguments differ from the pinned resolution in the run BOM")
     trainer = WaldoTrainer(model=model, args=args, train_dataset=Dataset(), data_collator=collate, callbacks=[Progress()])
     trainer.model_accepts_loss_kwargs = True
     result = trainer.train()
@@ -416,6 +499,11 @@ def run():
         raise ValueError("training stream exhausted before planned optimizer steps")
     if not math.isfinite(result.training_loss):
         raise ValueError("Transformers reported a non-finite training loss")
+    accumulation = parameters.get("gradient_accumulation_steps", 1)
+    if execution["micro_batches"] != parameters["steps"] * accumulation or execution["sequences"] != parameters["steps"] * parameters["batch_size"]:
+        raise ValueError("Trainer micro-batches or sequences differ from the resolved global batch and accumulation")
+    if bool(getattr(model, "is_gradient_checkpointing", False)) != bool(parameters.get("activation_checkpointing", False)):
+        raise ValueError("model gradient checkpointing differs from the resolved plan")
     evaluations = []
     evaluation = list(pack(evaluation_records, continuous=False))
     if evaluation:
@@ -441,7 +529,12 @@ def run():
         tokenizer_files.append("waldo_tokenizer.json")
     else:
         write_json(directory / "tokenizer.json", tokenizer)
-    write_json(directory / "runtime.json", dict(runtime_facts(device), package=spec["package"], hardware=device_facts, **parameter_evidence(model, config)))
+    executed = dict(optimizer_steps=trainer.state.global_step, micro_batches=execution["micro_batches"], sequences=execution["sequences"],
+                    per_device_train_batch_size=args.per_device_train_batch_size, gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    global_batch_size=args.per_device_train_batch_size * args.gradient_accumulation_steps,
+                    parameter_dtype=dtype, compute_dtype=sorted(execution["compute_dtypes"]), fp16=args.fp16, bf16=args.bf16,
+                    gradient_checkpointing=bool(getattr(model, "is_gradient_checkpointing", False)))
+    write_json(directory / "runtime.json", dict(runtime_facts(device), package=spec["package"], hardware=device_facts, execution=executed, **parameter_evidence(model, config)))
     artifacts = [dict(path=f"{prefix}/{name}", sha256=digest(directory / name), bytes=(directory / name).stat().st_size)
                  for name in ["model.safetensors", "config.json", "training_args.json", "runtime.json"] + tokenizer_files]
     emit("complete", observation=dict(simulated=False, steps=trainer.state.global_step, consumed_tokens=sum(consumption.values()), final_loss=result.training_loss,
@@ -453,6 +546,10 @@ if __name__ == "__main__":
         if sys.argv[1] == "--tokenizer":
             with contextlib.redirect_stdout(sys.stderr):
                 tokenizer_service()
+        elif sys.argv[1] == "--resolve-trainer":
+            with contextlib.redirect_stdout(sys.stderr):
+                resolution = resolve_trainer()
+            print(json.dumps(resolution, allow_nan=False))
         elif sys.argv[1] == "--probe":
             spec = json.loads(sys.argv[3])
             package = verify_package(sys.argv[2], spec["package"])
@@ -466,6 +563,6 @@ if __name__ == "__main__":
                 run()
     except Exception as error:
         traceback.print_exc(file=sys.stderr)
-        if sys.argv[1] != "--probe":
+        if sys.argv[1] not in ("--probe", "--resolve-trainer"):
             emit("error", error=str(error))
         sys.exit(1)

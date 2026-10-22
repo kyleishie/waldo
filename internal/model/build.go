@@ -370,6 +370,17 @@ func (builder Builder) Train(ctx context.Context, name string, prepared Prepared
 	if resolvedParameters.Compile && !capabilities.Compile {
 		return Inspection{}, fmt.Errorf("backend %s does not support compile", selection.Execution.Backend.Name)
 	}
+	if resolvedParameters.Trainer != nil {
+		resolver, ok := selection.Backend.(training.TrainerResolver)
+		if !ok {
+			return Inspection{}, fmt.Errorf("backend %s cannot resolve Transformers Trainer settings", selection.Execution.Backend.Name)
+		}
+		builder.report(Progress{Phase: "backend", Stage: stage.Name, Message: "resolving pinned Trainer settings"})
+		resolvedParameters, err = resolver.ResolveTrainer(ctx, architectureJSON, resolvedParameters)
+		if err != nil {
+			return Inspection{}, fmt.Errorf("stage %s resolve Trainer settings: %w", stage.Name, err)
+		}
+	}
 	if selection.Execution.WorldSize <= 1 {
 		selection.Execution.Parallelism.DataPlane = training.DataPlaneLocal
 	} else {
@@ -571,7 +582,7 @@ func reusableStagePreflight(inspection Inspection, identity string) (training.St
 		if err := snapshot.Validate(); err != nil {
 			return training.StagePreflight{}, 0, false, fmt.Errorf("run %04d: %w", bom.Ordinal, err)
 		}
-		if bom.EvaluationSet == nil || snapshot.Evaluation != *bom.EvaluationSet || !equivalentTrainingParameters(snapshot.Parameters, bom.Parameters) {
+		if bom.EvaluationSet == nil || snapshot.Evaluation != *bom.EvaluationSet || !equivalentTrainingParameters(snapshot.Parameters, plannedParameters(bom.Parameters)) {
 			return training.StagePreflight{}, 0, false, fmt.Errorf("run %04d preflight artifact does not match its run BOM", bom.Ordinal)
 		}
 		if snapshot.IdentitySHA256 == identity {
@@ -1997,9 +2008,9 @@ func validateStagedComposeRun(inspection Inspection, index int, prepared Prepare
 		conversation = *prepared.Stage.Conversation
 	}
 	corpusMatches := bom.CorpusBOMSHA256 == corpusHash || equivalentPlannedCorpusBOM(bom.CorpusBOM, prepared.BOM)
-	parametersMatch := equivalentTrainingParameters(bom.Parameters, parameters)
+	parametersMatch := equivalentTrainingParameters(plannedParameters(bom.Parameters), parameters)
 	if prepared.Stage.Parameters.Tokens > 0 {
-		parametersMatch = equivalentResumeParameters(bom.Parameters, parameters)
+		parametersMatch = equivalentResumeParameters(plannedParameters(bom.Parameters), parameters)
 	}
 	if bom.Stage != prepared.Stage.Name || bom.StageType != prepared.Stage.Type || bom.Objective != prepared.Stage.Objective || !reflect.DeepEqual(bom.Conversation, conversation) || !corpusMatches || !parametersMatch {
 		return fmt.Errorf("run %d immutable facts do not match stage %s (name=%t type=%t objective=%t conversation=%t corpus=%t parameters=%t; saved parameters=%+v; requested parameters=%+v)", index+1, prepared.Stage.Name,
@@ -2020,6 +2031,13 @@ func equivalentPlannedCorpusBOM(left, right corpus.BOM) bool {
 		right.Shards[index].Attestation = nil
 	}
 	return reflect.DeepEqual(left, right)
+}
+
+// plannedParameters removes the host-resolved Trainer evidence that a run BOM
+// adds after stage planning; the worker separately enforces that evidence.
+func plannedParameters(parameters training.ResolvedParameters) training.ResolvedParameters {
+	parameters.TrainerResolution = nil
+	return parameters
 }
 
 func equivalentTrainingParameters(left, right training.ResolvedParameters) bool {

@@ -4,10 +4,12 @@
 package training
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -17,7 +19,7 @@ import (
 )
 
 const BackendTransformers = "huggingface-transformers"
-const TransformersRevision = "builtin-transformers-worker-schema-1-r5"
+const TransformersRevision = "builtin-transformers-worker-schema-1-r6"
 
 //go:embed transformers_models.json
 var transformersModelsJSON string
@@ -101,12 +103,19 @@ type TransformersTrainer struct {
 
 // Arguments affecting WALDO's data stream, filesystem, topology, publication,
 // or stopping rules are deliberately not passthroughs. Unknown options fail.
+var transformersTrainerArguments = strings.Fields("per_device_train_batch_size per_device_eval_batch_size gradient_accumulation_steps learning_rate weight_decay adam_beta1 adam_beta2 adam_epsilon lr_scheduler_type lr_scheduler_kwargs warmup_steps max_grad_norm optim optim_args bf16 fp16 gradient_checkpointing gradient_checkpointing_kwargs use_cache logging_steps full_determinism")
+
+// TransformersTrainerArguments lists the allowlisted TrainingArguments fields.
+func TransformersTrainerArguments() []string {
+	return append([]string(nil), transformersTrainerArguments...)
+}
+
 func (trainer TransformersTrainer) Validate() error {
 	if trainer.Class != "Trainer" {
 		return fmt.Errorf("Transformers trainer.class must be Trainer")
 	}
 	allowed := map[string]bool{}
-	for _, key := range strings.Fields("per_device_train_batch_size per_device_eval_batch_size gradient_accumulation_steps learning_rate weight_decay adam_beta1 adam_beta2 adam_epsilon lr_scheduler_type lr_scheduler_kwargs warmup_steps max_grad_norm optim optim_args bf16 fp16 gradient_checkpointing gradient_checkpointing_kwargs use_cache logging_steps full_determinism") {
+	for _, key := range transformersTrainerArguments {
 		allowed[key] = true
 	}
 	for key := range trainer.Arguments {
@@ -116,6 +125,151 @@ func (trainer TransformersTrainer) Validate() error {
 	}
 	_, err := json.Marshal(trainer.Arguments)
 	return err
+}
+
+// TransformersExecution projects the Trainer arguments that carry WALDO's
+// portable execution facts (ADR 0071, 0073, 0083). Omitted values use the
+// Trainer defaults: accumulation 1, no fp16/bf16 autocast, no gradient
+// checkpointing, and no warmup.
+type TransformersExecution struct {
+	PerDeviceBatchSize      int64
+	GradientAccumulation    int64
+	LearningRate            float64
+	ComputePrecision        string
+	ActivationCheckpointing bool
+	Warmup                  float64
+}
+
+func (trainer TransformersTrainer) Execution() (TransformersExecution, error) {
+	data, err := json.Marshal(trainer.Arguments)
+	if err != nil {
+		return TransformersExecution{}, err
+	}
+	var arguments struct {
+		Batch         *int64   `json:"per_device_train_batch_size"`
+		Accumulation  *int64   `json:"gradient_accumulation_steps"`
+		Rate          *float64 `json:"learning_rate"`
+		FP16          *bool    `json:"fp16"`
+		BF16          *bool    `json:"bf16"`
+		Checkpointing *bool    `json:"gradient_checkpointing"`
+		Warmup        *float64 `json:"warmup_steps"`
+	}
+	if err := json.Unmarshal(data, &arguments); err != nil {
+		return TransformersExecution{}, fmt.Errorf("trainer.arguments: %w", err)
+	}
+	execution := TransformersExecution{GradientAccumulation: 1, ComputePrecision: "auto"}
+	if arguments.Batch == nil || arguments.Rate == nil {
+		return TransformersExecution{}, fmt.Errorf("trainer requires per_device_train_batch_size and learning_rate")
+	}
+	execution.PerDeviceBatchSize, execution.LearningRate = *arguments.Batch, *arguments.Rate
+	if arguments.Accumulation != nil {
+		execution.GradientAccumulation = *arguments.Accumulation
+	}
+	if execution.PerDeviceBatchSize <= 0 || execution.GradientAccumulation <= 0 || execution.PerDeviceBatchSize > math.MaxInt64/execution.GradientAccumulation || execution.LearningRate <= 0 || math.IsInf(execution.LearningRate, 0) {
+		return TransformersExecution{}, fmt.Errorf("trainer requires positive per_device_train_batch_size, gradient_accumulation_steps, and learning_rate")
+	}
+	fp16, bf16 := arguments.FP16 != nil && *arguments.FP16, arguments.BF16 != nil && *arguments.BF16
+	switch {
+	case fp16 && bf16:
+		return TransformersExecution{}, fmt.Errorf("trainer fp16 and bf16 are mutually exclusive")
+	case fp16:
+		execution.ComputePrecision = "float16"
+	case bf16:
+		execution.ComputePrecision = "bfloat16"
+	}
+	execution.ActivationCheckpointing = arguments.Checkpointing != nil && *arguments.Checkpointing
+	if arguments.Warmup != nil {
+		execution.Warmup = *arguments.Warmup
+	}
+	if execution.Warmup < 0 || math.IsInf(execution.Warmup, 0) {
+		return TransformersExecution{}, fmt.Errorf("trainer warmup_steps must be finite and non-negative")
+	}
+	return execution, nil
+}
+
+// GlobalBatchSize is the ADR 0071 optimizer batch while the engine is
+// single-process; a multi-process adapter must keep it fixed.
+func (execution TransformersExecution) GlobalBatchSize() int64 {
+	return execution.PerDeviceBatchSize * execution.GradientAccumulation
+}
+
+// WarmupSteps follows TrainingArguments.get_warmup_steps: values of at least 1
+// are step counts and smaller values are a fraction of the optimizer steps.
+func (execution TransformersExecution) WarmupSteps(steps int64) int64 {
+	if execution.Warmup >= 1 {
+		return int64(execution.Warmup)
+	}
+	return int64(math.Ceil(float64(steps) * execution.Warmup))
+}
+
+// ValidateTransformersPrecision rejects mixed-precision requests that do not
+// match the model's parameter dtype.
+func ValidateTransformersPrecision(computePrecision, parameterDType string) error {
+	if computePrecision == "float16" && parameterDType != "float32" {
+		return fmt.Errorf("trainer fp16 scaling requires float32 model parameters")
+	}
+	if computePrecision == "bfloat16" && parameterDType != "float32" && parameterDType != "bfloat16" {
+		return fmt.Errorf("trainer bf16 requires float32 or bfloat16 model parameters")
+	}
+	return nil
+}
+
+// TransformersTrainerResolution is the pinned package's effective value for
+// every allowlisted TrainingArguments field, resolved on the selected host
+// before a run exists. The worker must reproduce it exactly.
+type TransformersTrainerResolution struct {
+	Arguments   map[string]any `json:"arguments"`
+	WarmupSteps int64          `json:"warmup_steps"`
+}
+
+// WithTrainerResolution records a pinned Trainer resolution after checking
+// that it agrees with the requested arguments and the resolved native facts.
+func (parameters ResolvedParameters) WithTrainerResolution(resolution TransformersTrainerResolution) (ResolvedParameters, error) {
+	if parameters.Trainer == nil {
+		return ResolvedParameters{}, fmt.Errorf("Trainer resolution requires a trainer specification")
+	}
+	if len(resolution.Arguments) != len(transformersTrainerArguments) {
+		return ResolvedParameters{}, fmt.Errorf("Trainer resolution must report every allowlisted argument")
+	}
+	for _, key := range transformersTrainerArguments {
+		effective, exists := resolution.Arguments[key]
+		if !exists {
+			return ResolvedParameters{}, fmt.Errorf("Trainer resolution is missing %s", key)
+		}
+		if requested, exists := parameters.Trainer.Arguments[key]; exists {
+			same, err := sameJSON(requested, effective)
+			if err != nil {
+				return ResolvedParameters{}, err
+			}
+			if !same {
+				return ResolvedParameters{}, fmt.Errorf("pinned Trainer resolved %s to %v, not the requested %v", key, effective, requested)
+			}
+		}
+	}
+	execution, err := (TransformersTrainer{Class: parameters.Trainer.Class, Arguments: resolution.Arguments}).Execution()
+	if err != nil {
+		return ResolvedParameters{}, fmt.Errorf("pinned Trainer resolution: %w", err)
+	}
+	if execution.GlobalBatchSize() != parameters.BatchSize || execution.GradientAccumulation != parameters.GradientAccumulation || execution.LearningRate != parameters.LearningRate || execution.ComputePrecision != parameters.ComputePrecision || execution.ActivationCheckpointing != parameters.ActivationCheckpointing {
+		return ResolvedParameters{}, fmt.Errorf("pinned Trainer resolution differs from resolved batch, accumulation, learning rate, precision, or recomputation")
+	}
+	if resolution.WarmupSteps != execution.WarmupSteps(parameters.Steps) || resolution.WarmupSteps > parameters.Steps {
+		return ResolvedParameters{}, fmt.Errorf("pinned Trainer resolved %d warmup steps, not %d of %d", resolution.WarmupSteps, execution.WarmupSteps(parameters.Steps), parameters.Steps)
+	}
+	parameters.TrainerResolution = &resolution
+	return parameters, nil
+}
+
+func sameJSON(left, right any) (bool, error) {
+	a, err := json.Marshal(left)
+	if err != nil {
+		return false, err
+	}
+	b, err := json.Marshal(right)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(a, b), nil
 }
 
 //go:embed workers/transformers.py
@@ -133,15 +287,15 @@ type Transformers struct {
 }
 
 func (backend Transformers) Descriptor() Descriptor {
-	return Descriptor{Identity: Identity{Name: BackendTransformers, Revision: TransformersRevision}, Framework: BackendTransformers, Capabilities: Capabilities{Objectives: []string{"causal-language-modeling", "assistant-response-modeling"}, Safetensors: true}}
+	return Descriptor{Identity: Identity{Name: BackendTransformers, Revision: TransformersRevision}, Framework: BackendTransformers, Capabilities: Capabilities{Objectives: []string{"causal-language-modeling", "assistant-response-modeling"}, Safetensors: true, ActivationCheckpointing: true}}
 }
 
 func (backend Transformers) Run(ctx context.Context, request Request) (Observation, error) {
 	if request.Resume != nil {
 		return Observation{}, fmt.Errorf("Transformers checkpoint resume is not supported yet")
 	}
-	if request.Parameters.Trainer == nil {
-		return Observation{}, fmt.Errorf("Transformers run requires a trainer specification")
+	if request.Parameters.Trainer == nil || request.Parameters.TrainerResolution == nil {
+		return Observation{}, fmt.Errorf("Transformers run requires a trainer specification and its pinned resolution")
 	}
 	if err := request.Parameters.Trainer.Validate(); err != nil {
 		return Observation{}, err
@@ -152,6 +306,38 @@ func (backend Transformers) Run(ctx context.Context, request Request) (Observati
 		return Observation{}, err
 	}
 	return runPythonWorker(ctx, "Transformers", backend.Python, transformersWorker, request, backend.Wheel, string(deviceJSON))
+}
+
+// ResolveTrainer asks the pinned package on this host for its effective
+// TrainingArguments before a run exists, so the run BOM records what executes.
+func (backend Transformers) ResolveTrainer(ctx context.Context, architecture json.RawMessage, parameters ResolvedParameters) (ResolvedParameters, error) {
+	if parameters.Trainer == nil {
+		return ResolvedParameters{}, fmt.Errorf("Transformers run requires a trainer specification")
+	}
+	request, err := json.Marshal(map[string]any{"architecture": architecture, "parameters": parameters, "arguments": transformersTrainerArguments})
+	if err != nil {
+		return ResolvedParameters{}, err
+	}
+	deviceJSON, err := json.Marshal(backend.Device)
+	if err != nil {
+		return ResolvedParameters{}, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	command := exec.CommandContext(probeCtx, backend.Python, "-c", transformersWorker, "--resolve-trainer", backend.Wheel, string(request), string(deviceJSON))
+	var stderr cappedBuffer
+	command.Stderr = &stderr
+	output, err := command.Output()
+	if err != nil {
+		return ResolvedParameters{}, fmt.Errorf("resolve pinned Trainer arguments: %w%s", err, workerStderr(stderr.String()))
+	}
+	var resolution TransformersTrainerResolution
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&resolution); err != nil {
+		return ResolvedParameters{}, fmt.Errorf("invalid pinned Trainer resolution: %w", err)
+	}
+	return parameters.WithTrainerResolution(resolution)
 }
 
 type TransformersResolver struct{ Candidates []string }

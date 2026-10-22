@@ -300,6 +300,10 @@ type ResolvedParameters struct {
 	CheckpointEvery         int64                `json:"checkpoint_every"`
 	EvaluateEvery           int64                `json:"evaluate_every"`
 	PlannedTokenCapacity    int64                `json:"planned_token_capacity"`
+
+	// TrainerResolution is set only after the selected host's pinned package
+	// has resolved the trainer, before the run BOM is written.
+	TrainerResolution *TransformersTrainerResolution `json:"trainer_resolution,omitempty"`
 }
 
 type Optimizer struct {
@@ -479,4 +483,10 @@ type Evaluation struct {
 type Backend interface {
 	Descriptor() Descriptor
 	Run(context.Context, Request) (Observation, error)
+}
+
+// TrainerResolver is implemented by engines whose provider owns training
+// settings. It runs on the selected host before a run exists.
+type TrainerResolver interface {
+	ResolveTrainer(context.Context, json.RawMessage, ResolvedParameters) (ResolvedParameters, error)
 }

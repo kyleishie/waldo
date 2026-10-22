@@ -239,10 +239,8 @@ func validateStage(stage Stage, architecture Architecture) error {
 	if architecture.Family != "" && (architecture.Transformers != nil) != (stage.Parameters.Trainer != nil) {
 		return fmt.Errorf("stage trainer must match the architecture provider")
 	}
-	if stage.Parameters.Trainer != nil {
-		if err := stage.Parameters.Trainer.Validate(); err != nil {
-			return err
-		}
+	if err := validateTrainerStage(stage.Parameters.Trainer, architecture); err != nil {
+		return err
 	}
 	if !validName.MatchString(stage.Name) {
 		return fmt.Errorf("invalid training stage name %q", stage.Name)
