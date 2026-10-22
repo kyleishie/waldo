@@ -131,8 +131,15 @@ Omitting `base` constructs the model from its config with random weights.
 
 Each stage declares `trainer.class: Trainer` and `trainer.arguments`.
 `per_device_train_batch_size` and `learning_rate` are required here, not under
-`parameters`. Optional `gradient_accumulation_steps` defaults to 1; their product
-is WALDO's effective single-process batch size. The allowed passthroughs are:
+`parameters`. Optional `gradient_accumulation_steps` defaults to 1. Despite the
+Trainer name, the product of the two is the portable global optimizer batch in
+the [ADR 0071](adr/0071-global-batch-gradient-accumulation.md) sense: the number
+of packed sequences in each optimizer step. It does not scale with the number of
+devices on a host. The resolved global batch, accumulation, and precision belong
+in the run's immutable execution facts; resolving them before run creation,
+rather than only reporting Trainer's resolved arguments afterward, is planned.
+A future multi-process adapter must keep that global batch fixed. The allowed
+passthroughs are:
 
 - `per_device_train_batch_size`, `per_device_eval_batch_size`,
   `gradient_accumulation_steps`, `learning_rate`, `weight_decay`;
@@ -157,6 +164,15 @@ held-out evaluation, and saves final weights. Periodic evaluation/checkpoint
 scheduling and optimizer-checkpoint resume are not implemented. An interrupted
 attempt without a checkpoint restarts that stage; completed stages can supply
 verified weights to subsequent stages.
+
+The lifecycle contracts apply to this engine without exception. With held-out
+data, [ADR 0044](adr/0044-verify-persisted-training-artifacts.md) safety
+evaluations, [ADR 0079](adr/0079-publish-best-heldout-checkpoint.md)
+best-candidate publication, and reloaded-artifact verification are required.
+The current final-only evaluation is an implementation gap, not an accepted
+policy. Resume from verified checkpoint bundles under
+[ADR 0029](adr/0029-resumable-training-checkpoints.md) is planned and must not
+be relied on until implemented.
 
 ### Package pin and local runtime
 
@@ -188,9 +204,9 @@ export WALDO_TRANSFORMERS_WHEEL=/absolute/path/to/transformers-5.16.1-py3-none-a
 ```
 
 The environment needs the pinned wheel installed plus compatible `torch` and
-`accelerate` dependencies. `model.backend=auto` selects this adapter from the
-compose engine; an explicit `fake`, `mlx`, or `torchtitan` preference conflicts
-and fails. The adapter supports CPU or one visible CUDA/ROCm GPU; explicit
+`accelerate` dependencies. `model.backend` `auto` or `pytorch` selects this
+adapter from the compose engine; an explicit `fake`, `mlx`, or `torchtitan`
+preference conflicts and fails before a run is created. The adapter supports CPU or one visible CUDA/ROCm GPU; explicit
 GPU selection fails rather than falling back to CPU when unavailable.
 The worker hashes the local wheel, checks the installed distribution version,
 compares installed package files with wheel contents, and compiles verified
@@ -245,7 +261,10 @@ preserve an exact experiment for later review.
 
 The compose does not select MLX, PyTorch, TorchTitan, particular GPUs, paths,
 credentials, or other machine-local policy. WALDO selects a compatible backend
-and physical topology on the machine that runs the compose. A stage may request
+and physical topology on the machine that runs the compose. A schema-2 compose
+may name a training engine, `waldo-native` or `huggingface-transformers`. The
+engine defines the model and training semantics, not the machine; see
+[ADR 0083](adr/0083-portable-training-engines-and-host-backends.md). A stage may request
 a portable parallelism strategy, but `auto` is the default.
 
 ```bash
@@ -1029,8 +1048,10 @@ creates a different run contract and prevents an incompatible checkpoint from
 being resumed.
 
 The compose remains portable because backend selection and hardware are not
-part of it. Portability means WALDO can select any backend that implements the
-declared architecture and objective; it does not promise that every compose
+part of it. A training engine is part of the compose because it defines the
+architecture and objective; it narrows which hosts can run the compose but adds
+no machine facts. Portability means WALDO can select any backend that implements
+the declared engine, architecture, and objective; it does not promise that every compose
 fits every machine. Run `waldo model forecast` before allocating substantial
 compute.
 

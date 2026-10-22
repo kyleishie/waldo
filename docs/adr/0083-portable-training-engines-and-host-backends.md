@@ -1,6 +1,6 @@
 # ADR 0083: Version the compose envelope and separate training engines from host policy
 
-Status: proposed
+Status: accepted
 - Date: 2026-10-22
 - Amends: [0017](0017-portable-training-backend-contract.md) and
   [0020](0020-host-backend-policy.md)
@@ -135,8 +135,11 @@ exception. Any engine-specific exception requires its own ADR.
   model.
 - Real GPU validation remains an operator acceptance requirement, separate
   from CPU-only test success.
-- Until Transformers checkpoints satisfy ADR 0029, an interrupted Transformers
-  stage restarts that stage, and resume is not advertised.
+- Transformers runs adopt ADR 0029 resume rather than a separate mechanism:
+  checkpoint bundles carry Trainer optimizer, scheduler, scaler, and random
+  state, and WALDO positions the record stream. Until that is implemented, an
+  interrupted Transformers stage restarts that stage, and resume is not
+  advertised.
 - Upstream chat-template rendering, arbitrary model families and Trainer
   subclasses, distributed execution, tiktoken release packaging, and transitive
   dependency locks remain planned. Supported pairs and exact limits live in

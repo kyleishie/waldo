@@ -82,7 +82,7 @@ func (resolver EnvironmentResolver) Resolve(ctx context.Context, request Resolve
 	}
 	if envelope.Family == BackendTransformers {
 		if resolver.Preference != "" && resolver.Preference != BackendAuto && resolver.Preference != BackendPyTorch {
-			return Selection{}, fmt.Errorf("Transformers engine conflicts with model.backend=%s; use auto for this experimental adapter", resolver.Preference)
+			return Selection{}, fmt.Errorf("Transformers engine conflicts with model.backend=%s; use auto or pytorch for this experimental adapter", resolver.Preference)
 		}
 		if resolver.Cluster.Nodes > 1 || resolver.Cluster.WorldSize > 1 || resolver.Cluster.NodeRank > 0 {
 			return Selection{}, fmt.Errorf("Transformers engine currently supports single-process training only")

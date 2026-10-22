@@ -10,7 +10,15 @@ All durable formats in this document use schema 1.
 Schema-2 composes can also select the experimental Transformers engine.
 Its supported classes, argument ownership, package verification, artifacts, and
 current limitations are specified in [MODEL-COMPOSE.md](MODEL-COMPOSE.md).
+The engine belongs to the compose; backend adapter, devices, and topology remain
+machine-local policy ([ADR 0083](adr/0083-portable-training-engines-and-host-backends.md)).
 The native backend policy described below does not choose its model class.
+For the Transformers engine, `model.backend` accepts `auto` or `pytorch`, both
+of which select its PyTorch-based worker; other values fail before a run is
+created. Its device comes from the shared PyTorch hardware probe, optionally
+overridden by `WALDO_TRANSFORMERS_DEVICE`. The checkpoint resume described below
+is not yet implemented for this engine; an interrupted Transformers stage
+restarts.
 
 ## Machine configuration
 
