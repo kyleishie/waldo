@@ -62,6 +62,23 @@ launch. The binary, worker scratch, and resume staging are removed when the
 session finishes or aborts. Configure the same absolute scratch path on storage
 with enough capacity on every node; launcher state does not use `/tmp`.
 
+Uploads go to a unique temporary file in the session directory and are
+published only after their SHA-256 matches; a mismatch leaves nothing behind.
+WALDO refuses to stage the binary, worker state, or checkpoints unless the
+session directory, every ancestor, and every ancestor of its resolved path are
+owned by the remote user or root and cannot be modified by another account:
+
+- Directories owned by the remote user must not be writable by their group or
+  other users. Remove such access with `chmod go-w`. On Linux the group
+  permission bits include the POSIX ACL mask, so named ACL entries cannot grant
+  write access either.
+- Root-owned directories writable by other users, such as `/tmp`, must be
+  sticky.
+
+Staging fails and names the offending path otherwise. If another account
+created a directory on the scratch path first, an administrator must remove it
+before retrying.
+
 WALDO does not install or modify GPU drivers, CUDA, NCCL, Python, PyTorch, or
 TorchTitan. Those machine-level runtimes must be installed before training.
 

@@ -470,16 +470,103 @@ func (session *hostfileSession) remoteCommandContext(ctx context.Context, argume
 	return command
 }
 
+// remoteStagingFunctions defines POSIX shell functions for staging files on
+// secondary hosts. waldo_private_dir creates an absolute directory and
+// verifies that it, every ancestor, and every ancestor of its resolved path
+// are owned by the remote user or root and cannot be modified by another
+// account. Directories owned by the remote user must not be writable by their
+// group or other users. Root-owned directories writable by others, such as
+// /tmp, must be sticky. On Linux the group permission bits report the POSIX ACL
+// mask, which bounds every named ACL entry; other systems' extended ACLs cannot
+// be evaluated from the mode and are refused. Only portable tools are used so
+// the same script runs on Linux hosts and in macOS unit tests.
+const remoteStagingFunctions = `waldo_uid=$(id -u)
+waldo_system=$(uname -s)
+waldo_check_entry() {
+	waldo_listing=$(LC_ALL=C ls -ldn -- "$1") || return 1
+	set -- "$1" $waldo_listing
+	case $4 in
+	"$waldo_uid") waldo_owner=user ;;
+	0) waldo_owner=root ;;
+	*) echo "$1 is owned by uid $4, not uid $waldo_uid or root" >&2; return 1 ;;
+	esac
+	case $2 in l*) return 0 ;; esac
+	case $2 in
+	??????????+*)
+		if [ "$waldo_system" != Linux ]; then
+			echo "$1 has an access control list that cannot be verified" >&2
+			return 1
+		fi
+		;;
+	esac
+	case $2 in ?????w*|????????w*) ;; *) return 0 ;; esac
+	if [ "$waldo_owner" = root ]; then
+		case $2 in ?????????[tT]*) return 0 ;; esac
+		echo "$1 is writable by other users and is not sticky" >&2
+		return 1
+	fi
+	echo "$1 is writable by its group or other users; remove that access with chmod go-w" >&2
+	return 1
+}
+waldo_check_ancestors() {
+	waldo_path=$1
+	while :; do
+		waldo_check_entry "$waldo_path" || return 1
+		[ "$waldo_path" = / ] && return 0
+		waldo_path=$(dirname -- "$waldo_path")
+	done
+}
+waldo_private_dir() {
+	case $1 in /*) ;; *) echo "staging directory $1 is not absolute" >&2; return 1 ;; esac
+	mkdir -p -- "$1" || return 1
+	waldo_physical=$(cd -P -- "$1" && pwd -P) || return 1
+	waldo_check_ancestors "$1" || return 1
+	waldo_check_ancestors "$waldo_physical"
+}
+waldo_sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		waldo_sum=$(sha256sum -- "$1")
+	else
+		waldo_sum=$(shasum -a 256 -- "$1")
+	fi
+	printf '%s\n' "${waldo_sum%% *}"
+}
+`
+
+// remoteStageScript returns a script that receives a file on standard input
+// and publishes it at target only after its SHA-256 matches digest. The upload
+// goes to a unique temporary file inside the verified private directory and
+// is removed on any failure.
+func remoteStageScript(target, digest, mode, label string) string {
+	directory := shellQuote(filepath.Dir(target))
+	sum := shellQuote(digest)
+	return "set -euf\numask 077\n" + remoteStagingFunctions +
+		"waldo_private_dir " + directory + "\n" +
+		"tmp=$(mktemp " + directory + "/.waldo-transfer.XXXXXX)\n" +
+		"trap 'rm -f -- \"$tmp\"' EXIT\n" +
+		"cat > \"$tmp\"\n" +
+		"chmod " + mode + " \"$tmp\"\n" +
+		"sum=$(waldo_sha256 \"$tmp\")\n" +
+		"if [ \"$sum\" != " + sum + " ]; then echo \"staged " + label + " SHA-256 $sum does not match \"" + sum + " >&2; exit 1; fi\n" +
+		"mv -f -- \"$tmp\" " + shellQuote(target) + "\n"
+}
+
+// remoteVerifiedFileScript succeeds only when target already exists inside a
+// verified private directory with the expected SHA-256.
+func remoteVerifiedFileScript(target, digest string) string {
+	return "set -euf\numask 077\n" + remoteStagingFunctions +
+		"waldo_private_dir " + shellQuote(filepath.Dir(target)) + "\n" +
+		"test -f " + shellQuote(target) + "\n" +
+		"test \"$(waldo_sha256 " + shellQuote(target) + ")\" = " + shellQuote(digest) + "\n"
+}
+
 func (session *hostfileSession) stageBinary(host string) error {
 	file, err := os.Open(session.binary)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	temporary := session.remoteBinary + ".tmp"
-	remote := fmt.Sprintf("umask 077; mkdir -p %s; cat > %s; chmod 700 %s; test \"$(sha256sum %s | cut -d' ' -f1)\" = %s; mv -f %s %s",
-		shellQuote(session.remoteRoot), shellQuote(temporary), shellQuote(temporary), shellQuote(temporary), shellQuote(session.binarySHA256), shellQuote(temporary), shellQuote(session.remoteBinary))
-	command := session.remoteCommand(host, remote)
+	command := session.remoteCommand(host, remoteStageScript(session.remoteBinary, session.binarySHA256, "700", "WALDO"))
 	command.Stdin = file
 	var output strings.Builder
 	command.Stdout, command.Stderr = &output, &output
@@ -814,18 +901,14 @@ func (session *hostfileSession) stageResume(host string, artifacts []training.Ar
 	for index, artifact := range artifacts {
 		localPath := sources[index]
 		remotePath := targets[index]
-		check := fmt.Sprintf("test -f %s; test \"$(sha256sum %s | cut -d' ' -f1)\" = %s", shellQuote(remotePath), shellQuote(remotePath), shellQuote(artifact.SHA256))
-		if err := session.remoteCommand(host, check).Run(); err == nil {
+		if err := session.remoteCommand(host, remoteVerifiedFileScript(remotePath, artifact.SHA256)).Run(); err == nil {
 			continue
 		}
 		file, err := os.Open(localPath)
 		if err != nil {
 			return fmt.Errorf("stage checkpoint on %s: open %s: %w", host, artifact.Path, err)
 		}
-		temporary := remotePath + ".waldo-transfer"
-		remote := fmt.Sprintf("umask 077; mkdir -p %s; cat > %s; test \"$(sha256sum %s | cut -d' ' -f1)\" = %s; mv -f %s %s",
-			shellQuote(filepath.Dir(remotePath)), shellQuote(temporary), shellQuote(temporary), shellQuote(artifact.SHA256), shellQuote(temporary), shellQuote(remotePath))
-		command := session.remoteCommand(host, remote)
+		command := session.remoteCommand(host, remoteStageScript(remotePath, artifact.SHA256, "600", "checkpoint"))
 		command.Stdin = file
 		var output strings.Builder
 		command.Stdout, command.Stderr = &output, &output

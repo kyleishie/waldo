@@ -346,8 +346,9 @@ case "$*" in
     exit 0
     ;;
   *)
-    cat >/dev/null
-    exit 0
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+    shift 2
+    exec sh -c "$1"
     ;;
 esac
 `
@@ -368,7 +369,7 @@ esac
 	}
 	t.Cleanup(func() { listenHostfileRendezvous = previousListener })
 	cluster := training.Cluster{Nodes: 2, Rendezvous: "127.0.0.1:0", RendezvousID: "session-test"}
-	scratch := t.TempDir()
+	scratch := privateTempDir(t)
 	cacheRoot := t.TempDir()
 	cache, err := lookaside.NewCache(cacheRoot, nil, lookaside.WithPersistentStorage(scratch, 1<<20))
 	if err != nil {
@@ -388,6 +389,7 @@ esac
 	if !strings.HasPrefix(session.remoteRoot, scratch+string(os.PathSeparator)) {
 		t.Fatalf("remote launch root = %q, want beneath configured scratch %q", session.remoteRoot, scratch)
 	}
+	assertFileSHA256(t, session.remoteBinary, session.binarySHA256)
 	evaluation := training.EvaluationSet{Selection: "lowest-sha256-v1", SHA256: strings.Repeat("a", 64)}
 	if err := session.publish(model.MultiNodePlan{
 		Kind: model.MultiNodePlanKind, Schema: model.MultiNodePlanSchema,
@@ -750,5 +752,203 @@ func TestHostfileRemoteCommandUsesFuzzballWrapperContract(t *testing.T) {
 	}
 	if command.Cancel == nil || command.WaitDelay != hostfileWorkerExitGrace {
 		t.Fatal("Fuzzball wrapper lacks bounded graceful cancellation")
+	}
+}
+
+// installLocalSSH installs an ssh shim that runs the remote script on the
+// local host, exercising the real staging scripts with the test runner's
+// tools.
+func installLocalSSH(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	script := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec sh -c \"$1\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func newStagingSession(t *testing.T, scratch string) *hostfileSession {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "waldo")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := fileSHA256(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(scratch, "multinode", digest, "session-test")
+	return &hostfileSession{
+		ctx: context.Background(), cancel: func() {},
+		hostfile: trainingHostfile{Hosts: []string{"train-0", "train-1"}},
+		binary:   binary, binarySHA256: digest,
+		remoteRoot: root, remoteBinary: filepath.Join(root, "waldo"), resumeRoot: filepath.Join(root, "resume"),
+		output: io.Discard,
+	}
+}
+
+// privateTempDir returns a test directory that staging accepts. The testing
+// package creates t.TempDir with mode 0777 less the umask, which is
+// group-writable under the common umask 002.
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
+}
+
+func privateScratch(t *testing.T) string {
+	t.Helper()
+	scratch := filepath.Join(privateTempDir(t), "scratch")
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return scratch
+}
+
+func assertFileSHA256(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := fileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("%s SHA-256 = %s, want %s", path, got, want)
+	}
+}
+
+func assertNoTransferFiles(t *testing.T, directory string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".waldo-transfer.") {
+			t.Fatalf("temporary upload %s remains in %s", entry.Name(), directory)
+		}
+	}
+}
+
+func TestHostfileStageBinaryIntoVerifiedScratch(t *testing.T) {
+	installLocalSSH(t)
+	session := newStagingSession(t, privateScratch(t))
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := session.stageBinary("train-1"); err != nil {
+			t.Fatalf("stage attempt %d: %v", attempt+1, err)
+		}
+	}
+	assertFileSHA256(t, session.remoteBinary, session.binarySHA256)
+	for path, want := range map[string]os.FileMode{session.remoteBinary: 0o700, session.remoteRoot: 0o700} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("%s mode = %v, want %v", path, info.Mode().Perm(), want)
+		}
+	}
+	assertNoTransferFiles(t, session.remoteRoot)
+	session.cleanupStaging()
+	if _, err := os.Stat(session.remoteRoot); !os.IsNotExist(err) {
+		t.Fatalf("launch staging remains after cleanup: %v", err)
+	}
+}
+
+func TestHostfileStageBinaryRefusesDirectoriesOtherAccountsCanModify(t *testing.T) {
+	installLocalSSH(t)
+	for _, test := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "other-writable", mode: 0o777},
+		{name: "group-writable", mode: 0o770},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scratch := privateScratch(t)
+			if err := os.Chmod(scratch, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			session := newStagingSession(t, scratch)
+			err := session.stageBinary("train-1")
+			if err == nil || !strings.Contains(err.Error(), "writable by its group or other users") {
+				t.Fatalf("stage error = %v, want writable-directory refusal", err)
+			}
+			if !strings.Contains(err.Error(), filepath.Base(scratch)) {
+				t.Fatalf("stage error %q does not name the unsafe directory", err)
+			}
+			if _, statErr := os.Stat(session.remoteBinary); !os.IsNotExist(statErr) {
+				t.Fatalf("binary was staged in an unsafe directory: %v", statErr)
+			}
+		})
+	}
+	t.Run("symlink-to-writable", func(t *testing.T) {
+		base := privateTempDir(t)
+		shared := filepath.Join(base, "shared")
+		if err := os.Mkdir(shared, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(shared, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(base, "scratch")
+		if err := os.Symlink(shared, link); err != nil {
+			t.Fatal(err)
+		}
+		session := newStagingSession(t, link)
+		if err := session.stageBinary("train-1"); err == nil || !strings.Contains(err.Error(), "shared is writable") {
+			t.Fatalf("stage error = %v, want refusal of the resolved writable directory", err)
+		}
+	})
+}
+
+func TestHostfileStageBinaryFailsClosedOnDigestMismatch(t *testing.T) {
+	installLocalSSH(t)
+	session := newStagingSession(t, privateScratch(t))
+	session.binarySHA256 = strings.Repeat("0", 64)
+	err := session.stageBinary("train-1")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("stage error = %v, want digest mismatch", err)
+	}
+	if _, statErr := os.Stat(session.remoteBinary); !os.IsNotExist(statErr) {
+		t.Fatalf("binary was published despite a digest mismatch: %v", statErr)
+	}
+	assertNoTransferFiles(t, session.remoteRoot)
+}
+
+func TestHostfileStageResumeVerifiesCheckpointsInPrivateScratch(t *testing.T) {
+	installLocalSSH(t)
+	scratch := privateScratch(t)
+	session := newStagingSession(t, scratch)
+	source := filepath.Join(t.TempDir(), "runtime.pt")
+	if err := os.WriteFile(source, []byte("synthetic checkpoint"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := fileSHA256(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(session.resumeRoot, "run-42", "runtime.pt")
+	wrong := training.Artifact{Path: "runtime.pt", SHA256: strings.Repeat("0", 64)}
+	if err := session.stageResume("train-1", []training.Artifact{wrong}, []string{source}, []string{target}); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("stage error = %v, want digest mismatch", err)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("checkpoint was published despite a digest mismatch: %v", statErr)
+	}
+	assertNoTransferFiles(t, filepath.Dir(target))
+	artifact := training.Artifact{Path: "runtime.pt", SHA256: digest}
+	if err := session.stageResume("train-1", []training.Artifact{artifact}, []string{source}, []string{target}); err != nil {
+		t.Fatal(err)
+	}
+	assertFileSHA256(t, target, digest)
+	if err := os.Chmod(scratch, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.stageResume("train-1", []training.Artifact{artifact}, []string{source}, []string{target}); err == nil || !strings.Contains(err.Error(), "writable by its group or other users") {
+		t.Fatalf("stage error = %v, want an already staged checkpoint in an unsafe directory to be refused", err)
 	}
 }
