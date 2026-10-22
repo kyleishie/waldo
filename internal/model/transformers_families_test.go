@@ -170,9 +170,15 @@ func assertHFExecutionAgrees(t *testing.T, inspection model.Inspection, index in
 func hfPrepared(t *testing.T, stage model.Stage) model.PreparedStage {
 	t.Helper()
 	text := strings.Repeat("canonical parquet fixture ", 8)
+	return hfPreparedTexts(t, stage, text, text+" second")
+}
+
+// hfPreparedTexts prepares one canonical shard with one record per text.
+func hfPreparedTexts(t *testing.T, stage model.Stage, texts ...string) model.PreparedStage {
+	t.Helper()
 	var encoded bytes.Buffer
 	writer := parquet.NewGenericWriter[shard.Row](&encoded)
-	for _, text := range []string{text, text + " second"} {
+	for _, text := range texts {
 		if _, err := writer.Write([]shard.Row{{SHA256: record.TextHash(text), Kind: record.KindPretrain, Text: text, Source: "fixture", License: "CC0-1.0", Tokens: 128}}); err != nil {
 			t.Fatal(err)
 		}
@@ -187,12 +193,13 @@ func hfPrepared(t *testing.T, stage model.Stage) model.PreparedStage {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
+	records := int64(len(texts))
 	conversion := index.Conversion{Tool: "test", Version: "1", Profile: "text", Recipe: "test/v1", Tokenizer: "byte"}
-	measures := index.Measures{Shards: 1, Docs: 2, Tokens: 256, Bytes: int64(len(data))}
+	measures := index.Measures{Shards: 1, Docs: records, Tokens: 128 * records, Bytes: int64(len(data))}
 	bom := corpus.BOM{Kind: "openwaldo-bom", Schema: 1, Subject: "corpus", Paths: []string{"example"}, Licenses: map[string]index.Measures{"CC0-1.0": measures}, Totals: measures,
 		Manifests: []corpus.ManifestPin{{Path: "example/example.json", SHA256: strings.Repeat("a", 64), Name: "example", Title: "Example", Description: "HF test fixture", License: "CC0-1.0", Format: "parquet", RecordSchema: 1, ConvertedBy: conversion, Sources: []index.Source{{Name: "fixture", Source: "Fixture", URL: "https://example.test", SHA256: strings.Repeat("b", 64)}}, Totals: measures, Licenses: map[string]index.Measures{"CC0-1.0": measures}}},
-		Shards:    []corpus.ShardPin{{Manifest: "example/example.json", URL: "https://objects.example/" + digest, SHA256: digest, Format: "parquet", RecordSchema: 1, License: "CC0-1.0", ConvertedBy: conversion, Docs: 2, Tokens: 256, Bytes: int64(len(data))}}}
-	prepared, err := model.PrepareStage(stage, bom, []training.Input{{Path: path, SHA256: digest, Bytes: int64(len(data)), Records: 2}})
+		Shards:    []corpus.ShardPin{{Manifest: "example/example.json", URL: "https://objects.example/" + digest, SHA256: digest, Format: "parquet", RecordSchema: 1, License: "CC0-1.0", ConvertedBy: conversion, Docs: records, Tokens: 128 * records, Bytes: int64(len(data))}}}
+	prepared, err := model.PrepareStage(stage, bom, []training.Input{{Path: path, SHA256: digest, Bytes: int64(len(data)), Records: records}})
 	if err != nil {
 		t.Fatal(err)
 	}

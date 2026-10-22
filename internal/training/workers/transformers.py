@@ -18,7 +18,7 @@ import tempfile
 import traceback
 import zipfile
 
-REVISION = "builtin-transformers-worker-schema-1-r7"
+REVISION = "builtin-transformers-worker-schema-1-r8"
 PROTOCOL_OUTPUT = sys.stdout
 
 
@@ -329,6 +329,33 @@ def evaluation_due(step, steps, evaluate_every):
     return step == 1 or step == steps or (evaluate_every > 0 and step % evaluate_every == 0)
 
 
+def evaluation_targets(windows, evaluation_set):
+    """Scored held-out targets; they must equal the run BOM's pinned count."""
+    targets = sum(sum(label != -100 for label in window["labels"]) for window in windows)
+    if targets != evaluation_set["token_targets"]:
+        raise ValueError(f"evaluation stream has {targets} scored targets; run BOM pins {evaluation_set['token_targets']}")
+    return targets
+
+
+def heldout_metrics(nll, targets, evaluation_set):
+    """ADR 0081 exact intrinsic metrics from the summed NLL over the pinned view.
+
+    BPB divides by the pinned UTF-8 bytes of the held-out text, never by an
+    average bytes-per-token estimate. It is intrinsic distribution fit only.
+    """
+    if targets <= 0 or targets != evaluation_set["token_targets"]:
+        raise ArtifactIntegrityError(f"held-out NLL covers {targets} targets; run BOM pins {evaluation_set['token_targets']}")
+    if not math.isfinite(nll) or nll < 0:
+        raise ArtifactIntegrityError("held-out NLL is not finite and non-negative")
+    loss = nll / targets
+    text_bytes = evaluation_set["text_bytes"]
+    metrics = dict(heldout_loss=loss, heldout_perplexity=math.exp(min(loss, 80.0)), heldout_nll_sum=nll,
+                   heldout_target_tokens=float(targets), heldout_utf8_bytes=float(text_bytes))
+    if text_bytes > 0:
+        metrics["heldout_bits_per_byte"] = nll / (math.log(2.0) * text_bytes)
+    return metrics
+
+
 def select_candidate(evaluations, checkpoints):
     """Lowest persisted publishable held-out loss; ties keep the earliest step.
 
@@ -564,12 +591,13 @@ def run():
         raise ValueError(f"evaluation stream has {len(evaluation_records)} records; run BOM pins {begin['evaluation_set']['records']}")
     if evaluation_records and not evaluation:
         raise ValueError("held-out records produced no scored evaluation targets")
+    targets = evaluation_targets(evaluation, begin["evaluation_set"])
     mixed_precision = bool(args.fp16 or args.bf16)
     publication_dtype = dtype if device == "cuda" else "float32"
     evaluations, checkpoints = [], []
 
-    def heldout_loss(target):
-        """Held-out cross entropy over WALDO's pinned evaluation windows."""
+    def heldout_nll(target):
+        """Summed held-out NLL in nats over WALDO's pinned evaluation windows."""
         was_training = target.training
         target.eval()
         total, count = 0.0, 0
@@ -579,11 +607,19 @@ def run():
                     batch = collate(evaluation[offset:offset + args.per_device_eval_batch_size])
                     labels = batch["labels"].to(device)
                     outputs = target(input_ids=batch["input_ids"].to(device), attention_mask=batch["attention_mask"].to(device), use_cache=False)
-                    total += torch.nn.functional.cross_entropy(outputs.logits.float().reshape(-1, config.vocab_size), labels.reshape(-1), ignore_index=-100, reduction="sum").item()
+                    # Per-target FP32 cross entropy, summed in FP64 so the
+                    # total is not rounded at FP32 resolution.
+                    losses = torch.nn.functional.cross_entropy(outputs.logits.float().reshape(-1, config.vocab_size), labels.reshape(-1), ignore_index=-100, reduction="none")
+                    total += losses.sum(dtype=torch.float64).item()
                     count += labels.ne(-100).sum().item()
         finally:
             target.train(was_training)
-        return total / count
+        if count != targets:
+            raise ArtifactIntegrityError(f"held-out evaluation scored {count} targets; run BOM pins {targets}")
+        return total
+
+    def heldout_loss(target):
+        return heldout_nll(target) / targets
 
     def construct(target_dtype):
         """Build a fresh model exactly as chat does, without perturbing training RNG."""
@@ -591,14 +627,14 @@ def run():
             fresh = getattr(transformers, spec["model_class"])(getattr(transformers, spec["config_class"])(**json.loads(json.dumps(config.to_dict()))))
         return fresh.to(device=device, dtype=getattr(torch, target_dtype))
 
-    def reload_heldout_loss(path):
+    def reload_heldout_nll(path):
         # Chat reloads config.json and model.safetensors into a new model in
         # the parameter dtype on CUDA, FP32 on CPU, eager and without autocast.
         reloaded = construct(publication_dtype)
         load_model(reloaded, str(path), strict=True)
-        loss = heldout_loss(reloaded)
+        nll = heldout_nll(reloaded)
         del reloaded
-        return loss
+        return nll
 
     def save_weights(source, path):
         temporary = path.with_name(path.name + ".tmp")
@@ -621,14 +657,14 @@ def run():
         candidate = directory / name
         candidate.mkdir(parents=True, exist_ok=False)
         save_weights(model, candidate / "model.safetensors")
-        publishable = reload_heldout_loss(candidate / "model.safetensors")
+        metrics = heldout_metrics(reload_heldout_nll(candidate / "model.safetensors"), targets, begin["evaluation_set"])
+        publishable = metrics["heldout_loss"]
         check_agreement(publishable, live_loss, f"step {step} persisted {publication_dtype} candidate",
                         "correct checkpoint serialization or dtype conversion before spending more compute")
         checkpoints.append(dict(step=step, tokens=tokens, artifacts=[dict(path=f"{prefix}/{name}/model.safetensors", sha256=digest(candidate / "model.safetensors"),
                                                                           bytes=(candidate / "model.safetensors").stat().st_size)]))
         item = dict(step=step, tokens=tokens, metrics={
-            "heldout_loss": publishable,
-            "heldout_perplexity": math.exp(min(publishable, 80.0)),
+            **metrics,
             "live_eager_compute_heldout_loss": compute_loss,
             "live_eager_heldout_loss": live_loss,
             "publishable_checkpoint_heldout_loss": publishable,
@@ -636,9 +672,10 @@ def run():
             "artifact_loss_delta": publishable - live_loss,
         })
         evaluations.append(item)
-        # A log, not a durable evaluation event: these candidates are publication
-        # evidence, not resume points, so an interrupted run restarts cleanly.
-        emit("event", event=dict(kind="log", step=step, tokens=tokens,
+        # The standard evaluation event carries the exact intrinsic metrics to
+        # telemetry and durable progress. Candidate checkpoints are still not
+        # announced as resume points, so an interrupted run restarts at step 0.
+        emit("event", event=dict(kind="evaluation", step=step, tokens=tokens, evaluation=item,
                                  message=f"step {step} publishable held-out loss {publishable:.4f} (live {live_loss:.4f}, compute {compute_loss:.4f})"))
 
     evaluate_every = parameters.get("evaluate_every", 0)
@@ -679,7 +716,7 @@ def run():
         save_weights(published, directory / "model.safetensors")
         del published
         candidate_loss = selected["metrics"]["heldout_loss"]
-        artifact_loss = reload_heldout_loss(directory / "model.safetensors")
+        artifact_loss = heldout_metrics(reload_heldout_nll(directory / "model.safetensors"), targets, begin["evaluation_set"])["heldout_loss"]
         check_agreement(artifact_loss, candidate_loss, "saved artifact", f"it does not reproduce selected step {selected['step']}")
         selected["metrics"].update(artifact_heldout_loss=artifact_loss, artifact_heldout_perplexity=math.exp(min(artifact_loss, 80.0)),
                                    serialization_loss_delta=artifact_loss - candidate_loss)

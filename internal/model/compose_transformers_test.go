@@ -440,37 +440,78 @@ func (backend transformersIdentityBackend) Descriptor() training.Descriptor {
 // ADR 0044/0079 completion evidence is enforced for Transformers exactly as for
 // the native real backends: the published artifact must be the verified best
 // persisted candidate, even when the final step regressed.
+// transformersIntrinsicMetrics returns the ADR 0081 metrics a worker reports
+// for a summed held-out NLL over the run BOM's pinned evaluation view.
+func transformersIntrinsicMetrics(set training.EvaluationSet, loss float64) map[string]float64 {
+	nll := loss * float64(set.TokenTargets)
+	metrics := map[string]float64{
+		"heldout_loss": nll / float64(set.TokenTargets), "heldout_perplexity": math.Exp(loss), "heldout_nll_sum": nll,
+		"heldout_target_tokens": float64(set.TokenTargets), "heldout_utf8_bytes": float64(set.TextBytes),
+	}
+	if set.TextBytes > 0 {
+		metrics["heldout_bits_per_byte"] = nll / (math.Ln2 * float64(set.TextBytes))
+	}
+	return metrics
+}
+
+func writeTransformersArtifact(t *testing.T, directory, name string) training.Artifact {
+	t.Helper()
+	path := filepath.Join(directory, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	return training.Artifact{Path: "artifacts/" + name, SHA256: hex.EncodeToString(digest[:]), Bytes: int64(len(data))}
+}
+
+// transformersCandidateObservation is a two-step Transformers completion
+// whose final step (2) regressed, so step 1 is the best persisted candidate.
+// It reports each evaluation as the worker does, then completes.
+func transformersCandidateObservation(t *testing.T, request training.Request) training.Observation {
+	t.Helper()
+	tokens := request.Parameters.PlannedTokenCapacity
+	evaluations := []training.Evaluation{
+		{Step: 1, Tokens: tokens / 2, Metrics: transformersIntrinsicMetrics(request.EvaluationSet, 1.0)},
+		{Step: 2, Tokens: tokens, Metrics: transformersIntrinsicMetrics(request.EvaluationSet, 1.5)},
+	}
+	if request.Report != nil {
+		for index := range evaluations {
+			evaluation := evaluations[index]
+			evaluation.Metrics = cloneMetrics(evaluation.Metrics)
+			request.Report(training.Event{Kind: "evaluation", Step: evaluation.Step, Tokens: evaluation.Tokens, Evaluation: &evaluation, Message: "candidate evaluated"})
+		}
+	}
+	evaluations[0].Metrics["artifact_heldout_loss"] = evaluations[0].Metrics["heldout_loss"] + 0.001
+	return training.Observation{
+		Steps: request.Parameters.Steps, ConsumedTokens: tokens,
+		Checkpoints: []training.Checkpoint{
+			{Step: 1, Tokens: tokens / 2, Artifacts: []training.Artifact{writeTransformersArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000001/model.safetensors")}},
+			{Step: 2, Tokens: tokens, Artifacts: []training.Artifact{writeTransformersArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000002/model.safetensors")}},
+		},
+		Evaluations:        evaluations,
+		SelectedCheckpoint: &training.CheckpointSelection{Step: 1, Tokens: tokens / 2, Metric: "heldout_loss", Value: evaluations[0].Metrics["heldout_loss"]},
+		Artifacts:          []training.Artifact{writeTransformersArtifact(t, request.ArtifactDirectory, "model.safetensors")},
+	}
+}
+
+func transformersTestBuilder(root string, run backendFunc) Builder {
+	backend := transformersIdentityBackend{trainerResolvingBackend{
+		backendFunc: run,
+		resolve: func(parameters training.ResolvedParameters) (training.ResolvedParameters, error) {
+			return parameters.WithTrainerResolution(pinnedTrainerResolution(parameters, 0))
+		},
+	}}
+	return Builder{Root: root, Resolver: training.ResolverFunc(func(context.Context, training.ResolveRequest) (training.Selection, error) {
+		return testSelection(backend), nil
+	})}
+}
+
 func TestTransformersCompletionRequiresVerifiedBestCandidate(t *testing.T) {
-	writeArtifact := func(t *testing.T, directory, name string) training.Artifact {
-		t.Helper()
-		path := filepath.Join(directory, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		data := []byte(name)
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		digest := sha256.Sum256(data)
-		return training.Artifact{Path: "artifacts/" + name, SHA256: hex.EncodeToString(digest[:]), Bytes: int64(len(data))}
-	}
-	// The final step (2) regressed; step 1 is the best persisted candidate.
-	observation := func(t *testing.T, request training.Request) training.Observation {
-		tokens := request.Parameters.PlannedTokenCapacity
-		return training.Observation{
-			Steps: request.Parameters.Steps, ConsumedTokens: tokens,
-			Checkpoints: []training.Checkpoint{
-				{Step: 1, Tokens: tokens / 2, Artifacts: []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000001/model.safetensors")}},
-				{Step: 2, Tokens: tokens, Artifacts: []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "checkpoints/step-00000002/model.safetensors")}},
-			},
-			Evaluations: []training.Evaluation{
-				{Step: 1, Tokens: tokens / 2, Metrics: map[string]float64{"heldout_loss": 1.0, "artifact_heldout_loss": 1.001}},
-				{Step: 2, Tokens: tokens, Metrics: map[string]float64{"heldout_loss": 1.5}},
-			},
-			SelectedCheckpoint: &training.CheckpointSelection{Step: 1, Tokens: tokens / 2, Metric: "heldout_loss", Value: 1.0},
-			Artifacts:          []training.Artifact{writeArtifact(t, request.ArtifactDirectory, "model.safetensors")},
-		}
-	}
+	observation := transformersCandidateObservation
 	for _, test := range []struct {
 		name   string
 		mutate func(*training.Observation)
@@ -488,6 +529,15 @@ func TestTransformersCompletionRequiresVerifiedBestCandidate(t *testing.T) {
 		{name: "missing evaluations", mutate: func(value *training.Observation) {
 			value.Evaluations, value.SelectedCheckpoint = nil, nil
 		}, want: "no metrics"},
+		{name: "missing exact NLL", mutate: func(value *training.Observation) { delete(value.Evaluations[1].Metrics, "heldout_nll_sum") }, want: "does not report heldout_nll_sum"},
+		{name: "missing bits per byte", mutate: func(value *training.Observation) { delete(value.Evaluations[0].Metrics, "heldout_bits_per_byte") }, want: "does not report heldout_bits_per_byte"},
+		{name: "unpinned targets", mutate: func(value *training.Observation) { value.Evaluations[1].Metrics["heldout_target_tokens"]++ }, want: "run BOM pins"},
+		{name: "unpinned bytes", mutate: func(value *training.Observation) { value.Evaluations[1].Metrics["heldout_utf8_bytes"]-- }, want: "run BOM pins"},
+		{name: "loss is not summed NLL", mutate: func(value *training.Observation) { value.Evaluations[1].Metrics["heldout_nll_sum"] *= 1.01 }, want: "not its summed NLL over the pinned targets"},
+		{name: "bits per byte uses another denominator", mutate: func(value *training.Observation) {
+			metrics := value.Evaluations[1].Metrics
+			metrics["heldout_bits_per_byte"] = metrics["heldout_nll_sum"] / (math.Ln2 * (metrics["heldout_utf8_bytes"] + 1))
+		}, want: "pinned UTF-8 bytes"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			compose, _, err := LoadCompose("../../docs/examples/transformers-smoke.yaml")
@@ -495,25 +545,19 @@ func TestTransformersCompletionRequiresVerifiedBestCandidate(t *testing.T) {
 				t.Fatal(err)
 			}
 			compose.Stages[0].Corpora = NewCorpusSelections([]string{"example"})
-			backend := transformersIdentityBackend{trainerResolvingBackend{
-				backendFunc: func(_ context.Context, request training.Request) (training.Observation, error) {
-					if request.EvaluationSet.Records == 0 {
-						t.Fatal("fixture has no held-out set")
-					}
-					value := observation(t, request)
-					if test.mutate != nil {
-						test.mutate(&value)
-					}
-					return value, nil
-				},
-				resolve: func(parameters training.ResolvedParameters) (training.ResolvedParameters, error) {
-					return parameters.WithTrainerResolution(pinnedTrainerResolution(parameters, 0))
-				},
-			}}
 			root := t.TempDir()
-			builder := Builder{Root: root, Resolver: training.ResolverFunc(func(context.Context, training.ResolveRequest) (training.Selection, error) {
-				return testSelection(backend), nil
-			})}
+			builder := transformersTestBuilder(root, func(_ context.Context, request training.Request) (training.Observation, error) {
+				if request.EvaluationSet.Records == 0 || request.EvaluationSet.TextBytes == 0 {
+					t.Fatal("fixture has no held-out set")
+				}
+				// Report no durable events, so the completion alone is judged.
+				request.Report = nil
+				value := observation(t, request)
+				if test.mutate != nil {
+					test.mutate(&value)
+				}
+				return value, nil
+			})
 			inspection, err := builder.Compose(context.Background(), "selection", compose, []PreparedStage{preparedFixture(t, compose.Stages[0])})
 			if test.want == "" {
 				if err != nil {

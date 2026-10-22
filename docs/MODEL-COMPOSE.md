@@ -159,7 +159,17 @@ facts. The native `parameters` fields `batch_size`, `learning_rate`,
 rejected even when they would agree. `evaluate_every` is a WALDO lifecycle
 cadence, not a Trainer argument, and remains a native stage parameter; for a
 Transformers stage it defaults to `0`, so only the step-1 and terminal safety
-evaluations run unless a periodic interval is set. WALDO derives the
+evaluations run unless a periodic interval is set. Each of these evaluations is
+a standard `evaluation` event and run-record entry with the
+[ADR 0081](adr/0081-version-intrinsic-loss-telemetry.md) exact intrinsic
+metrics of the publishable candidate: the summed NLL over exactly the run BOM's
+pinned held-out targets, those targets, the pinned UTF-8 bytes, token loss and
+perplexity, and bits per byte. WALDO rejects a completion whose metrics do not
+match that pinned evidence. Selection still uses held-out token loss within the
+run; BPB is an intrinsic cross-tokenizer comparison, not a capability or
+promotion signal. Candidates are not resume points, so an interrupted
+Transformers run restarts at step 0 and its abandoned evaluations remain only
+in telemetry. WALDO derives the
 resolved native facts from the Trainer arguments, using these provider defaults
 when an argument is omitted:
 

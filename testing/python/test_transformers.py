@@ -149,6 +149,60 @@ class TransformersStreamTests(unittest.TestCase):
         self.assertEqual(list(worker.windows([dict(tokens=[3], loss_mask=[False, False])], 3, 0, 259, 2)), [])
 
 
+class EvaluationMetricTests(unittest.TestCase):
+    """ADR 0081 exact intrinsic metrics over WALDO's pinned held-out views."""
+
+    def pinned(self, targets, text_bytes):
+        return dict(records=1, token_targets=targets, text_bytes=text_bytes)
+
+    def test_masks_eos_and_long_records_score_each_target_once(self):
+        # A masked prompt token, a record longer than one window (as a
+        # contiguous tail produces), and the appended EOS target.
+        records = [dict(tokens=[3, 4, 5], loss_mask=[False, False, True, True], corpus="a"),
+                   dict(tokens=list(range(3, 13)), corpus="b")]
+        windows = list(worker.windows(records, 4, 0, 259, 2, continuous=False))
+        # Record 1 scores 5 and EOS; record 2 scores its last 9 tokens and EOS.
+        self.assertEqual(worker.evaluation_targets(windows, self.pinned(12, 13)), 12)
+        with self.assertRaisesRegex(ValueError, "pins 13"):
+            worker.evaluation_targets(windows, self.pinned(13, 13))
+
+    def test_exact_bits_per_byte_uses_summed_nll_and_pinned_bytes(self):
+        nll = 41.5
+        metrics = worker.heldout_metrics(nll, 20, self.pinned(20, 30))
+        self.assertEqual(metrics["heldout_nll_sum"], nll)
+        self.assertEqual(metrics["heldout_target_tokens"], 20.0)
+        self.assertEqual(metrics["heldout_utf8_bytes"], 30.0)
+        self.assertEqual(metrics["heldout_loss"], nll / 20)
+        self.assertAlmostEqual(metrics["heldout_perplexity"], math.exp(nll / 20))
+        self.assertEqual(metrics["heldout_bits_per_byte"], nll / (math.log(2.0) * 30))
+
+    def test_unicode_byte_and_tokenizer_denominators(self):
+        # Seven characters, ten UTF-8 bytes. The byte tokenizer scores one
+        # target per byte; a subword tokenizer scores fewer, larger targets.
+        text = "na\u00efve \u2603"
+        text_bytes = len(text.encode("utf-8"))
+        self.assertEqual((len(text), text_bytes), (7, 10))
+        byte_record = dict(tokens=[value + 3 for value in text.encode("utf-8")])
+        subword_record = dict(tokens=[10, 11, 12])
+        byte_targets = worker.evaluation_targets(list(worker.windows([byte_record], 8, 0, 259, 2, continuous=False)), self.pinned(10, text_bytes))
+        subword_targets = worker.evaluation_targets(list(worker.windows([subword_record], 8, 0, 259, 2, continuous=False)), self.pinned(3, text_bytes))
+        self.assertEqual((byte_targets, subword_targets), (10, 3))
+        # Equal total NLL is equal BPB, although per-token loss differs.
+        byte_metrics = worker.heldout_metrics(22.0, byte_targets, self.pinned(10, text_bytes))
+        subword_metrics = worker.heldout_metrics(22.0, subword_targets, self.pinned(3, text_bytes))
+        self.assertEqual(byte_metrics["heldout_bits_per_byte"], subword_metrics["heldout_bits_per_byte"])
+        self.assertNotEqual(byte_metrics["heldout_loss"], subword_metrics["heldout_loss"])
+
+    def test_inconsistent_or_nonfinite_totals_fail_closed(self):
+        for nll, targets, pinned in [(1.0, 3, self.pinned(4, 8)), (1.0, 0, self.pinned(0, 8)),
+                                     (math.nan, 4, self.pinned(4, 8)), (math.inf, 4, self.pinned(4, 8)), (-1.0, 4, self.pinned(4, 8))]:
+            with self.subTest(nll=nll, targets=targets), self.assertRaises(worker.ArtifactIntegrityError):
+                worker.heldout_metrics(nll, targets, pinned)
+
+    def test_missing_byte_evidence_omits_bits_per_byte(self):
+        self.assertNotIn("heldout_bits_per_byte", worker.heldout_metrics(2.0, 2, self.pinned(2, 0)))
+
+
 class TokenizerVerificationTests(unittest.TestCase):
     def test_verified_snapshot_and_failures(self):
         with tempfile.TemporaryDirectory() as source:

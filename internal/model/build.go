@@ -745,6 +745,12 @@ func (builder Builder) resumeTraining(ctx context.Context, name string, inspecti
 		checkpoint := run.Progress.Checkpoints[len(run.Progress.Checkpoints)-1]
 		resume = &training.ResumePoint{Step: checkpoint.Step, Tokens: checkpoint.Tokens, Checkpoint: checkpoint, Checkpoints: append([]training.Checkpoint(nil), run.Progress.Checkpoints...), Evaluations: append([]training.Evaluation(nil), run.Progress.Evaluations...)}
 	}
+	if resume == nil && run.Progress != nil && selection.Execution.Backend.Name == training.BackendTransformers {
+		// Transformers reports durable evaluations but no resume points, so an
+		// interrupted run restarts at step 0. Its abandoned evaluations remain
+		// in telemetry; they must not constrain or merge into the new attempt.
+		run.Progress = nil
+	}
 	if resume != nil {
 		runDirectory := filepath.Join(inspection.Path, "runs", runDirectoryName(pin))
 		for _, artifact := range resume.Checkpoint.Artifacts {
@@ -912,6 +918,11 @@ func (builder Builder) executeTrainingAttempt(ctx context.Context, name, modelPa
 						if !verified {
 							backendErr = fmt.Errorf("invalid backend observation: selected %s checkpoint does not verify the persisted model artifact", selection.Execution.Backend.Name)
 						}
+					}
+				}
+				if backendErr == nil && selection.Execution.Backend.Name == training.BackendTransformers {
+					if err := validateIntrinsicHeldoutMetrics(*set, observation.Evaluations); err != nil {
+						backendErr = fmt.Errorf("invalid backend observation: %w", err)
 					}
 				}
 			}

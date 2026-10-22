@@ -46,8 +46,12 @@ func TestTransformersHuggingFaceTokenizerSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	observation := inspection.Runs[0].Observation
-	if inspection.Runs[0].State != RunComplete || observation == nil || observation.Simulated || observation.Steps != 2 || observation.ConsumedTokens != 16 || len(observation.Evaluations) != 1 {
+	if inspection.Runs[0].State != RunComplete || observation == nil || observation.Simulated || observation.Steps != 2 || observation.ConsumedTokens != 16 || len(observation.Evaluations) != 2 {
 		t.Fatalf("unexpected result: %+v", observation)
+	}
+	// Step-1 safety and terminal evaluations, exact over the pinned held-out view.
+	if err := validateIntrinsicHeldoutMetrics(*inspection.RunBOMs[0].EvaluationSet, observation.Evaluations); err != nil {
+		t.Fatal(err)
 	}
 	directory := filepath.Join(inspection.Path, "runs", runDirectoryName(inspection.Model.Runs[0]))
 	found := map[string]bool{}
