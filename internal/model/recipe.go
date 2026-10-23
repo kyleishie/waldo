@@ -869,6 +869,15 @@ func (architecture Architecture) ResolveTokenizer() (training.TokenizerSpec, tra
 }
 
 func (architecture Architecture) Forecast() (ArchitectureForecast, error) {
+	if architecture.Transformers != nil {
+		structure, ok, err := architecture.transformersStructure()
+		if err != nil {
+			return ArchitectureForecast{}, err
+		}
+		if ok {
+			return architecture.transformersForecast(structure)
+		}
+	}
 	embedding, err := multiply(architecture.VocabularySize, architecture.HiddenSize)
 	if err != nil {
 		return ArchitectureForecast{}, err
@@ -905,24 +914,6 @@ func (architecture Architecture) Forecast() (ArchitectureForecast, error) {
 	if err != nil {
 		return ArchitectureForecast{}, err
 	}
-	if architecture.Transformers != nil && architecture.Transformers.ModelClass == "MixtralForCausalLM" {
-		experts, _, err := architecture.Transformers.ExpertCounts()
-		if err != nil {
-			return ArchitectureForecast{}, err
-		}
-		mlp, err = multiply(mlp, experts)
-		if err != nil {
-			return ArchitectureForecast{}, err
-		}
-		router, err := multiply(architecture.HiddenSize, experts)
-		if err != nil {
-			return ArchitectureForecast{}, err
-		}
-		mlp, err = add(mlp, router)
-		if err != nil {
-			return ArchitectureForecast{}, err
-		}
-	}
 	block, err := add(attention, mlp)
 	if err != nil {
 		return ArchitectureForecast{}, err
@@ -953,6 +944,26 @@ func (architecture Architecture) Forecast() (ArchitectureForecast, error) {
 			return ArchitectureForecast{}, err
 		}
 	}
+	formula := "embedding + decoder projections + gated MLP + norms; biases excluded"
+	if architecture.Transformers != nil {
+		formula = "dense-decoder proxy, not a hybrid parameter, state, or memory estimate; measured parameter count is recorded in runtime.json"
+	}
+	return architecture.parameterForecast(parameters, formula)
+}
+
+func (architecture Architecture) transformersForecast(structure transformersStructure) (ArchitectureForecast, error) {
+	parameters, err := structure.total(architecture.Layers)
+	if err != nil {
+		return ArchitectureForecast{}, err
+	}
+	formula := "estimated provider structure from architecture.config and pinned class defaults; measured count is recorded in runtime.json"
+	if structure.experts > 1 {
+		formula = "estimated resident parameters including all experts and routers, not active-per-token parameters; measured counts are recorded in runtime.json"
+	}
+	return architecture.parameterForecast(parameters, formula)
+}
+
+func (architecture Architecture) parameterForecast(parameters uint64, formula string) (ArchitectureForecast, error) {
 	bytesPerParameter := uint64(4)
 	if architecture.ParameterDType != "float32" {
 		bytesPerParameter = 2
@@ -960,16 +971,6 @@ func (architecture Architecture) Forecast() (ArchitectureForecast, error) {
 	parameterBytes, err := multiply(parameters, bytesPerParameter)
 	if err != nil {
 		return ArchitectureForecast{}, err
-	}
-	formula := "embedding + decoder projections + gated MLP + norms; biases excluded"
-	if architecture.Transformers != nil {
-		formula = "rough native decoder approximation for Transformers; config-specific projections may differ; measured count is recorded in runtime.json"
-		if architecture.Transformers.ModelClass == "MixtralForCausalLM" {
-			formula = "rough resident parameter estimate including all experts and routers, not active-per-token parameters; measured counts are recorded in runtime.json"
-		}
-		if architecture.Transformers.ModelClass == "Qwen3_5ForCausalLM" {
-			formula = "rough dense-decoder proxy, not a hybrid state or memory estimate; measured parameter count is recorded in runtime.json"
-		}
 	}
 	return ArchitectureForecast{ApproximateParameters: parameters, ParameterBytes: parameterBytes, Formula: formula}, nil
 }

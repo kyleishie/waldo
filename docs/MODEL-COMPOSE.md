@@ -58,10 +58,12 @@ Mixtral requires explicit `num_local_experts`, `num_experts_per_tok`, and
 gradient accumulation. Padding is excluded from router balancing via an
 attention mask; assistant loss masking does not remove prompt context from
 attention. Held-out loss remains pure token-weighted cross entropy.
-Forecasts include all resident experts; `runtime.json` records measured total
-and expert parameters plus an explicitly defined active-parameter estimate.
-Hybrid forecasts are only dense-decoder proxies, not recurrent-state or memory
-estimates. Use measured runtime counts rather than treating forecasts as exact.
+Forecast totals include all resident experts and report a separate estimated
+active-parameter count; `runtime.json` records measured total and expert
+parameters plus the same active-parameter definition. Hybrid forecasts are only
+dense-decoder proxies, not recurrent-state or memory estimates, and report their
+decomposition as `unavailable`. Use measured runtime counts rather than treating
+forecasts as exact.
 
 ### Supported-feature matrix
 
@@ -104,8 +106,10 @@ No parameter-count field is required. Declare `vocab_size`, `hidden_size`,
 `intermediate_size`, `num_hidden_layers`, `num_attention_heads`,
 `num_key_value_heads`, and `max_position_embeddings` in `architecture.config`.
 Other recognized configuration values are forwarded to the selected config
-class. Unknown config keys fail during runtime preflight. The forecast uses a
-rough decoder approximation, not an exact provider-specific count. The worker
+class. Unknown config keys fail during runtime preflight. The forecast reports
+an `estimated` family-aware structural count, or a labelled dense proxy for the
+hybrid. It is not an exact provider count; see [provider fitness
+semantics](MODEL-TRAINING-FITNESS.md#provider-fitness-semantics). The worker
 records the actual parameter count and resolved config after construction.
 
 `architecture.tokenizer` supports WALDO's `{name, revision}` byte/tiktoken
@@ -381,7 +385,8 @@ and objective, so their exact tokens, steps, and added runtime are reported
 during training preflight rather than guessed.
 
 Forecast JSON includes a versioned `forecast.fitness` object. It decomposes
-WALDO's exact bias-free RoPE/RMSNorm/GQA/SwiGLU architecture, reports both
+WALDO's exact bias-free RoPE/RMSNorm/GQA/SwiGLU architecture, labels provider
+decompositions as `estimated` or `unavailable`, reports both
 conventional `6ND` and architecture-aware compute approximations, separates
 memory components, and shows batch arithmetic for compatible world sizes.
 Corpus-dependent fields explicitly say `requires-corpus-preflight` (the stable
